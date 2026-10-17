@@ -11,11 +11,12 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 
-DEFAULT_WORKBOOK = Path(r"C:\automação salesforce\Geoex_Metropolitana.xlsx")
-DEFAULT_OUTPUT = Path(r"C:\automação salesforce\Respostas")
+DEFAULT_WORKBOOK = Path(r"D:\automação salesforce\Geoex_Metropolitana.xlsx")
+DEFAULT_OUTPUT = Path(r"D:\automação salesforce\Respostas")
 DEFAULT_SHEET = "Notas sem evidências"
 DEFAULT_COLUMN = "Nota"
 DEFAULT_SALESFORCE_URL = "https://wfmneoenergia.my.salesforce.com/"
+DEFAULT_WHATSAPP_GROUP = "Teste Geoex"
 REPORT_NAME = "relatorio_processamento.csv"
 LEGACY_REPORT_FIELDS = (
     "nota",
@@ -39,6 +40,7 @@ REPORT_FIELDS = (
     "arquivos_baixados",
     "erro",
 )
+SUCCESSFUL_SALESFORCE_STATUSES = frozenset({"Concluída", "Sem imagens"})
 SOURCE_METADATA_COLUMNS = {
     "texto_code_acao": "Texto code ação",
     "codigo_acao": "Código de ação",
@@ -272,10 +274,43 @@ def write_report(
                 row.update(previous_rows.get(note, {}))
                 row.update(updates.get(note, {}))
                 writer.writerow(row)
-        os.replace(temporary_name, report_path)
+        try:
+            os.replace(temporary_name, report_path)
+        except PermissionError as error:
+            raise PermissionError(
+                f"Não foi possível atualizar o relatório '{report_path}'. "
+                "Feche-o no Excel ou em qualquer outro programa que o esteja "
+                "usando e execute novamente."
+            ) from error
     finally:
         if os.path.exists(temporary_name):
             os.remove(temporary_name)
+
+
+def prepare_report(
+    report_path: Path,
+    notes: list[str],
+    metadata: dict[str, dict[str, str]],
+    *,
+    read_only: bool = False,
+) -> dict[str, dict[str, str]]:
+    if read_only and report_path.is_file():
+        return read_existing_report(report_path)
+    write_report(report_path, notes, metadata)
+    return read_existing_report(report_path)
+
+
+def select_notes_to_process(
+    notes: list[str],
+    existing_rows: dict[str, dict[str, str]],
+    limit: int,
+) -> list[str]:
+    successful_notes = {
+        note
+        for note, row in existing_rows.items()
+        if row.get("status") in SUCCESSFUL_SALESFORCE_STATUSES
+    }
+    return [note for note in notes if note not in successful_notes][:limit]
 
 
 def parse_args() -> argparse.Namespace:
@@ -310,6 +345,28 @@ def parse_args() -> argparse.Namespace:
             "(padrão: %%LOCALAPPDATA%%\\SalesforceAutomation\\ChromeProfile)."
         ),
     )
+    parser.add_argument(
+        "--enviar-whatsapp",
+        action="store_true",
+        help=(
+            "Publica imagens e descrições no grupo do WhatsApp e envia um ZIP "
+            "da pasta de respostas."
+        ),
+    )
+    parser.add_argument(
+        "--grupo-whatsapp",
+        default=DEFAULT_WHATSAPP_GROUP,
+        help=f"Nome exato do grupo de WhatsApp (padrão: {DEFAULT_WHATSAPP_GROUP}).",
+    )
+    parser.add_argument(
+        "--perfil-whatsapp",
+        type=Path,
+        default=None,
+        help=(
+            "Diretório do perfil dedicado do Chrome para WhatsApp "
+            "(padrão: %%LOCALAPPDATA%%\\SalesforceAutomation\\WhatsAppProfile)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -328,21 +385,25 @@ def main() -> int:
             (args.saida / note).mkdir(exist_ok=True)
         write_note_descriptions(args.saida, notes, metadata)
         report_path = args.saida / REPORT_NAME
-        write_report(report_path, notes, metadata)
+        existing_rows = prepare_report(
+            report_path,
+            notes,
+            metadata,
+            read_only=args.enviar_whatsapp and not args.consultar_salesforce,
+        )
         if args.consultar_salesforce:
             if args.limite < 1:
                 raise ValueError("--limite deve ser maior que zero.")
-            from salesforce import consultar_notas
-
-            resultados = consultar_notas(
-                notes[: args.limite],
-                args.salesforce_url,
-                args.saida,
-                args.perfil_chrome,
+            notes_to_process = select_notes_to_process(
+                notes,
+                existing_rows,
+                args.limite,
             )
-            existing_rows = read_existing_report(report_path)
-            result_updates = {}
-            for resultado in resultados:
+            from salesforce import ResultadoNota, consultar_notas
+
+            result_updates: dict[str, dict[str, str]] = {}
+
+            def save_result(resultado: ResultadoNota) -> None:
                 row = existing_rows[resultado.nota].copy()
                 row.update(
                     {
@@ -353,12 +414,34 @@ def main() -> int:
                     }
                 )
                 result_updates[resultado.nota] = row
-            write_report(
-                report_path,
-                notes,
-                result_updates,
+                write_report(report_path, notes, result_updates)
+
+            if notes_to_process:
+                resultados = consultar_notas(
+                    notes_to_process,
+                    args.salesforce_url,
+                    args.saida,
+                    args.perfil_chrome,
+                    on_result=save_result,
+                )
+            else:
+                resultados = []
+            skipped_success_count = sum(
+                existing_rows.get(note, {}).get("status")
+                in SUCCESSFUL_SALESFORCE_STATUSES
+                for note in notes
             )
-    except (FileNotFoundError, InvalidFileException, PermissionError, ValueError) as error:
+        if args.enviar_whatsapp:
+            existing_rows = read_existing_report(report_path)
+            from whatsapp import enviar_respostas
+
+            enviar_respostas(
+                args.saida,
+                existing_rows,
+                args.grupo_whatsapp,
+                args.perfil_whatsapp,
+            )
+    except (OSError, InvalidFileException, ValueError) as error:
         print(f"Erro: {error}", file=sys.stderr)
         return 1
     except RuntimeError as error:
@@ -370,6 +453,7 @@ def main() -> int:
     print(f"Pastas por nota: {args.saida}")
     if args.consultar_salesforce:
         print(f"Notas consultadas no Salesforce: {len(resultados)}")
+        print(f"Notas já concluídas ignoradas: {skipped_success_count}")
     else:
         print("Nenhuma consulta ou alteração foi feita no Salesforce.")
     return 0

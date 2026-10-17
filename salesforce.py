@@ -3,6 +3,7 @@ import re
 import shutil
 import time
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -451,31 +452,11 @@ def _abrir_compromisso_servico(
         )
     appointment_id = appointment_id_match.group(1)
 
-    def appointment_link(browser: webdriver.Chrome) -> WebElement | bool:
-        cards = browser.find_elements(
-            By.XPATH,
-            "//article[contains(., 'Compromissos de serviços')]",
-        )
-        for card in cards:
-            for anchor in card.find_elements(By.XPATH, ".//a[@href]"):
-                try:
-                    href = anchor.get_attribute("href") or ""
-                    if appointment_id in href and anchor.is_displayed():
-                        return anchor
-                except StaleElementReferenceException:
-                    continue
-        return False
-
     try:
-        link = wait.until(appointment_link)
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'}); "
-            "arguments[0].click();",
-            link,
-        )
+        driver.get(appointment_url)
         wait.until(
             lambda browser: (
-                "/lightning/r/ServiceAppointment/" in browser.current_url
+                "/lightning/r/" in browser.current_url
                 and appointment_id in browser.current_url
             )
         )
@@ -921,6 +902,7 @@ def consultar_notas(
     salesforce_url: str,
     output_dir: Path,
     profile_dir: Path | None,
+    on_result: Callable[[ResultadoNota], None] | None = None,
 ) -> list[ResultadoNota]:
     driver = criar_navegador(output_dir, profile_dir)
     results: list[ResultadoNota] = []
@@ -931,6 +913,8 @@ def consultar_notas(
         for note in notes:
             result = _processar_nota(driver, output_dir, note)
             results.append(result)
+            if on_result is not None:
+                on_result(result)
             print(
                 f"Nota {note}: {result.status}"
                 + (f" ({result.erro})" if result.erro else "")

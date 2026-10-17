@@ -32,6 +32,9 @@ campos, a coluna `UTD` da planilha, o status, o motivo, os arquivos baixados e
 erros em `relatorio_processamento.csv`, que abre no Excel. Notas repetidas são
 processadas uma única vez. Resultados já registrados são preservados quando a
 fila é gerada novamente.
+Mantenha esse CSV fechado no Excel durante consultas ao Salesforce, pois os
+resultados são gravados progressivamente. No modo somente WhatsApp, um relatório
+existente é lido sem ser regravado.
 
 ## Consultar uma nota no Salesforce
 
@@ -77,9 +80,57 @@ Para consultar mais notas, aumente o limite explicitamente:
 python automacao.py --consultar-salesforce --limite 10
 ```
 
+O limite conta somente notas ainda não concluídas. Nas execuções seguintes,
+notas com status `Concluída` ou `Sem imagens` são ignoradas; notas pendentes,
+com erro ou parciais podem ser tentadas novamente. Cada resultado é salvo no
+relatório assim que a nota termina, permitindo retomar a fila sem reprocessar
+as notas já concluídas. Se não houver notas para processar, o Chrome não será
+aberto.
+
 Os downloads dependem do acesso do Chrome aos arquivos do Salesforce e podem
 falhar se a rede ou a sessão da organização bloquear os arquivos. Erros são
-registrados no relatório. O script não edita registros nem envia mensagens.
+registrados no relatório. A consulta ao Salesforce não envia mensagens ao
+WhatsApp por padrão.
+
+## Publicar no WhatsApp
+
+O envio é uma opção separada. Para publicar as notas concluídas e, por último,
+enviar um ZIP com todo o conteúdo de `Respostas`:
+
+```powershell
+python automacao.py --enviar-whatsapp
+```
+
+O Chrome usa um perfil separado em
+`%LOCALAPPDATA%\SalesforceAutomation\WhatsAppProfile`. Na primeira execução,
+leia manualmente o QR Code do WhatsApp Web. O programa procura o grupo pelo
+nome exato `Teste Geoex` (padrão) e pede confirmação no terminal
+uma vez antes de iniciar os envios. Após a confirmação, as notas e o ZIP são
+enviados automaticamente, sem confirmações individuais. Só são publicadas
+notas com status `Concluída` e imagens; notas sem imagens, pendentes ou com
+erro não são publicadas individualmente. Todas as imagens de cada nota são
+anexadas juntas pelo menu `Fotos e vídeos` como fotos originais, e a descrição
+combinada com o motivo de impedimento, quando preenchido, é enviada como legenda
+na mesma mensagem. Se o WhatsApp não aceitar o lote de imagens ou não oferecer
+o campo de legenda, o envio da nota é interrompido; a descrição não é enviada
+separadamente.
+
+Também é possível consultar o Salesforce e enviar no mesmo comando:
+
+```powershell
+python automacao.py --consultar-salesforce --limite 100 --enviar-whatsapp
+```
+
+Use `--grupo-whatsapp "Nome exato do grupo"` para escolher outro grupo ou
+`--perfil-whatsapp "C:\caminho\perfil"` para informar outro perfil. O arquivo
+`Respostas.zip` é criado ao lado da pasta `Respostas`, evitando incluí-lo dentro
+de si mesmo. Um registro local fora da pasta guarda os envios confirmados:
+conteúdo idêntico já enviado não é publicado novamente; notas ou arquivos
+alterados podem ser enviados novamente.
+
+O programa não envia credenciais nem acessa uma API externa do WhatsApp; a
+sessão permanece no perfil local do Chrome. Confirme cuidadosamente o grupo e
+o conteúdo antes de autorizar o envio.
 
 ## Validação
 
