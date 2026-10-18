@@ -126,7 +126,10 @@ Use `--grupo-whatsapp "Nome exato do grupo"` para escolher outro grupo ou
 `Respostas.zip` é criado ao lado da pasta `Respostas`, evitando incluí-lo dentro
 de si mesmo. Um registro local fora da pasta guarda os envios confirmados:
 conteúdo idêntico já enviado não é publicado novamente; notas ou arquivos
-alterados podem ser enviados novamente.
+alterados podem ser enviados novamente. Para o ZIP, o envio só é confirmado
+quando a mensagem aparece no grupo com o indicador de envio concluído; essa
+confirmação pode levar até cinco minutos. Estados antigos sem essa confirmação
+serão tratados como não verificados e o ZIP será enviado novamente uma vez.
 
 O programa não envia credenciais nem acessa uma API externa do WhatsApp; a
 sessão permanece no perfil local do Chrome. Confirme cuidadosamente o grupo e

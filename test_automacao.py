@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 import zipfile
@@ -52,6 +53,7 @@ from whatsapp import (
     _click_media_menu_item,
     _media_dialog,
     _open_group,
+    _wait_for_document_sent,
     _send_button,
     _send_media,
     _send_images_with_caption,
@@ -656,6 +658,100 @@ class SalesforceNavigationTests(unittest.TestCase):
 
 
 class WhatsAppDeliveryTests(unittest.TestCase):
+    def test_document_send_waits_for_new_message_to_be_marked_sent(self):
+        driver = Mock()
+        archive_path = Path("Respostas.zip")
+        old_message = {"id": "old", "sent": True}
+        pending_message = {"id": "new", "sent": False}
+        sent_message = {"id": "new", "sent": True}
+        wait_timeouts = []
+
+        class ImmediateWait:
+            def __init__(self, _driver, timeout):
+                wait_timeouts.append(timeout)
+
+            def until(self, condition):
+                for _ in range(3):
+                    if condition(driver):
+                        return True
+                raise AssertionError("The document was not confirmed as sent.")
+
+        with (
+            patch(
+                "whatsapp._media_dialog",
+                side_effect=[Mock(), False, False],
+            ),
+            patch(
+                "whatsapp._document_message_states",
+                side_effect=[
+                    [old_message, pending_message],
+                    [old_message, sent_message],
+                ],
+            ),
+            patch("whatsapp.WebDriverWait", ImmediateWait),
+        ):
+            _wait_for_document_sent(driver, archive_path, {"old"})
+
+        self.assertEqual(wait_timeouts, [300])
+
+    def test_document_send_timeout_is_not_treated_as_success(self):
+        driver = Mock()
+        archive_path = Path("Respostas.zip")
+
+        class ImmediateWait:
+            def __init__(self, _driver, _timeout):
+                pass
+
+            def until(self, condition):
+                if condition(driver):
+                    return True
+                raise TimeoutException()
+
+        with (
+            patch("whatsapp._media_dialog", return_value=False),
+            patch(
+                "whatsapp._document_message_states",
+                return_value=[{"id": "new", "sent": False}],
+            ),
+            patch("whatsapp.WebDriverWait", ImmediateWait),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "não confirmou o envio"
+            ):
+                _wait_for_document_sent(driver, archive_path, set())
+
+    def test_legacy_delivery_state_retries_unconfirmed_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "Respostas"
+            output_dir.mkdir()
+            state_path = root / ".Respostas_whatsapp_state.json"
+            state_path.write_text(
+                json.dumps({"notes": {}, "archive_sha256": "old-hash"}),
+                encoding="utf-8",
+            )
+            driver = Mock()
+
+            with (
+                patch("whatsapp._create_browser", return_value=driver),
+                patch("whatsapp._wait_for_search_input"),
+                patch("whatsapp._open_group"),
+                patch("whatsapp._send_document") as send_document,
+            ):
+                enviar_respostas(
+                    output_dir,
+                    {},
+                    DEFAULT_WHATSAPP_GROUP,
+                    input_fn=lambda _prompt: "s",
+                )
+
+            send_document.assert_called_once_with(
+                driver, root / "Respostas.zip"
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["version"], 2)
+            self.assertTrue(state["archive_sha256"])
+
     def test_retries_fresh_attachment_button_lookup_after_stale_dom(self):
         driver = Mock()
         driver.execute_script.side_effect = [

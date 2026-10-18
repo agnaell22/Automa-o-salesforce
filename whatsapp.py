@@ -23,9 +23,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 LOGIN_TIMEOUT_SECONDS = 300
 PAGE_TIMEOUT_SECONDS = 30
+DOCUMENT_SEND_TIMEOUT_SECONDS = 300
 CAPTION_FIELD_TIMEOUT_SECONDS = 3
 MEDIA_MENU_TIMEOUT_SECONDS = 10
 SUCCESSFUL_SALESFORCE_STATUSES = frozenset({"Concluída"})
+WHATSAPP_STATE_VERSION = 2
 IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp"}
 )
@@ -74,7 +76,11 @@ def _state_path(output_dir: Path) -> Path:
 
 def _load_state(state_path: Path) -> dict[str, Any]:
     if not state_path.exists():
-        return {"notes": {}, "archive_sha256": ""}
+        return {
+            "version": WHATSAPP_STATE_VERSION,
+            "notes": {},
+            "archive_sha256": "",
+        }
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -89,6 +95,17 @@ def _load_state(state_path: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"O estado de envios do WhatsApp está inválido: {state_path}"
         )
+    version = state.get("version")
+    if version is not None and (
+        not isinstance(version, int) or version not in (1, WHATSAPP_STATE_VERSION)
+    ):
+        raise RuntimeError(
+            f"A versão do estado de envios do WhatsApp não é compatível: "
+            f"{state_path}"
+        )
+    if version != WHATSAPP_STATE_VERSION:
+        state["archive_sha256"] = ""
+        state["version"] = WHATSAPP_STATE_VERSION
     return state
 
 
@@ -969,9 +986,16 @@ def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
         )
         if not send_button:
             raise TimeoutException("O botão de envio do ZIP não apareceu.")
+        existing_message_ids = {
+            message["id"]
+            for message in _document_message_states(driver, archive_path.name)
+            if message["id"]
+        }
         driver.execute_script("arguments[0].click()", send_button)
-        WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-            lambda browser: not _media_dialog(browser)
+        _wait_for_document_sent(
+            driver,
+            archive_path,
+            existing_message_ids,
         )
     except TimeoutException as error:
         raise RuntimeError(
@@ -981,6 +1005,74 @@ def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
         raise RuntimeError(
             "Falha do navegador ao enviar o ZIP pelo WhatsApp Web: "
             f"{error.msg.splitlines()[0]}"
+        ) from error
+
+
+def _document_message_states(
+    driver: webdriver.Chrome,
+    filename: str,
+) -> list[dict[str, str | bool]]:
+    messages = driver.execute_script(
+        """
+        const visible = (element) =>
+            element.getClientRects().length > 0 &&
+            getComputedStyle(element).visibility !== 'hidden';
+        return [...document.querySelectorAll('[data-testid="msg-container"]')]
+            .filter((message) => visible(message) &&
+                (message.innerText || message.textContent || '').includes(arguments[0]))
+            .map((message) => {
+                const statusLabels = [
+                    ...message.querySelectorAll('[data-icon], [data-testid]')
+                ].map((element) => [
+                    element.getAttribute('data-icon'),
+                    element.getAttribute('data-testid')
+                ].filter(Boolean).join(' ').toLowerCase());
+                return {
+                    id: message.getAttribute('data-id') ||
+                        message.querySelector('[data-id]')?.getAttribute('data-id') || '',
+                    sent: statusLabels.some((label) =>
+                        /\\bmsg-(?:check|dblcheck)\\b/.test(label))
+                };
+            });
+        """,
+        filename,
+    )
+    if not isinstance(messages, list) or any(
+        not isinstance(message, dict)
+        or not isinstance(message.get("id"), str)
+        or not isinstance(message.get("sent"), bool)
+        for message in messages
+    ):
+        raise RuntimeError(
+            "O WhatsApp Web retornou um estado inválido para a confirmação "
+            "do envio do documento."
+        )
+    return messages
+
+
+def _wait_for_document_sent(
+    driver: webdriver.Chrome,
+    archive_path: Path,
+    previous_message_ids: set[str],
+) -> None:
+    def is_document_sent(browser: webdriver.Chrome) -> bool:
+        if _media_dialog(browser):
+            return False
+        return any(
+            message["id"] not in previous_message_ids and message["sent"]
+            for message in _document_message_states(browser, archive_path.name)
+            if message["id"]
+        )
+
+    try:
+        WebDriverWait(driver, DOCUMENT_SEND_TIMEOUT_SECONDS).until(
+            is_document_sent
+        )
+    except TimeoutException as error:
+        raise RuntimeError(
+            f"O WhatsApp Web não confirmou o envio de '{archive_path.name}' "
+            f"em {DOCUMENT_SEND_TIMEOUT_SECONDS} segundos. O ZIP não foi "
+            "marcado como enviado; verifique o grupo e tente novamente."
         ) from error
 
 
