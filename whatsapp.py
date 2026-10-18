@@ -988,7 +988,7 @@ def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
             raise TimeoutException("O botão de envio do ZIP não apareceu.")
         existing_message_ids = {
             message["id"]
-            for message in _document_message_states(driver, archive_path.name)
+            for message in _document_message_states(driver)
             if message["id"]
         }
         driver.execute_script("arguments[0].click()", send_button)
@@ -1010,7 +1010,6 @@ def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
 
 def _document_message_states(
     driver: webdriver.Chrome,
-    filename: str,
 ) -> list[dict[str, str | bool]]:
     messages = driver.execute_script(
         """
@@ -1018,8 +1017,7 @@ def _document_message_states(
             element.getClientRects().length > 0 &&
             getComputedStyle(element).visibility !== 'hidden';
         return [...document.querySelectorAll('[data-testid="msg-container"]')]
-            .filter((message) => visible(message) &&
-                (message.innerText || message.textContent || '').includes(arguments[0]))
+            .filter(visible)
             .map((message) => {
                 const statusLabels = [
                     ...message.querySelectorAll('[data-icon], [data-testid]')
@@ -1031,11 +1029,10 @@ def _document_message_states(
                     id: message.getAttribute('data-id') ||
                         message.querySelector('[data-id]')?.getAttribute('data-id') || '',
                     sent: statusLabels.some((label) =>
-                        /\\bmsg-(?:check|dblcheck)\\b/.test(label))
+                        /msg-(?:dbl)?check(?:\\b|-)/.test(label))
                 };
             });
         """,
-        filename,
     )
     if not isinstance(messages, list) or any(
         not isinstance(message, dict)
@@ -1060,7 +1057,7 @@ def _wait_for_document_sent(
             return False
         return any(
             message["id"] not in previous_message_ids and message["sent"]
-            for message in _document_message_states(browser, archive_path.name)
+            for message in _document_message_states(browser)
             if message["id"]
         )
 

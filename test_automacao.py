@@ -51,6 +51,7 @@ from whatsapp import (
     _find_file_input,
     _click_attachment_button,
     _click_media_menu_item,
+    _document_message_states,
     _media_dialog,
     _open_group,
     _wait_for_document_sent,
@@ -658,6 +659,19 @@ class SalesforceNavigationTests(unittest.TestCase):
 
 
 class WhatsAppDeliveryTests(unittest.TestCase):
+    def test_document_message_lookup_does_not_depend_on_visible_filename(self):
+        driver = Mock()
+        expected = [{"id": "message-id", "sent": True}]
+        driver.execute_script.return_value = expected
+
+        result = _document_message_states(driver)
+
+        self.assertEqual(result, expected)
+        script = driver.execute_script.call_args.args[0]
+        self.assertIn("[data-testid=\"msg-container\"]", script)
+        self.assertIn("msg-(?:dbl)?check", script)
+        self.assertEqual(len(driver.execute_script.call_args.args), 1)
+
     def test_document_send_waits_for_new_message_to_be_marked_sent(self):
         driver = Mock()
         archive_path = Path("Respostas.zip")
