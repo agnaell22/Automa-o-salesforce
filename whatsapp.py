@@ -24,6 +24,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 LOGIN_TIMEOUT_SECONDS = 300
 PAGE_TIMEOUT_SECONDS = 30
 CAPTION_FIELD_TIMEOUT_SECONDS = 3
+MEDIA_MENU_TIMEOUT_SECONDS = 10
 SUCCESSFUL_SALESFORCE_STATUSES = frozenset({"Concluída"})
 IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp"}
@@ -509,6 +510,24 @@ def _media_dialog(driver: webdriver.Chrome) -> WebElement | bool:
     return False
 
 
+def _conversation_compose_box(driver: webdriver.Chrome) -> WebElement | bool:
+    for element in driver.find_elements(
+        By.CSS_SELECTOR,
+        "[data-testid='conversation-compose-box-input']",
+    ):
+        if _visible(element):
+            return element
+    return False
+
+
+def _wait_for_conversation_compose_box(driver: webdriver.Chrome) -> None:
+    compose_box = WebDriverWait(driver, MEDIA_MENU_TIMEOUT_SECONDS).until(
+        _conversation_compose_box
+    )
+    if not compose_box:
+        raise TimeoutException("O campo de composição da conversa não apareceu.")
+
+
 def _media_preview_diagnostics(driver: webdriver.Chrome) -> str:
     diagnostics = driver.execute_script(
         """
@@ -601,52 +620,188 @@ def _send_button(dialog: WebElement) -> WebElement | bool:
     return False
 
 
-def _media_menu_item(driver: webdriver.Chrome) -> WebElement | bool:
-    photo_video_labels = {
-        "fotos e vídeos",
-        "fotos e videos",
-        "photos & videos",
-        "photos and videos",
-    }
-    for element in driver.find_elements(
-        By.XPATH,
-        "//*[@role='menuitem'] | //*[@role='button'] | //button | //div",
-    ):
-        label = " ".join(
-            (
-                element.text or "",
-                element.get_attribute("aria-label") or "",
-                element.get_attribute("title") or "",
-            )
-        ).strip().casefold()
-        if _visible(element) and label in photo_video_labels:
-            return driver.execute_script(
-                """
-                return arguments[0].closest(
+def _media_menu_diagnostics(driver: webdriver.Chrome) -> str:
+    try:
+        diagnostics = driver.execute_script(
+            """
+            const visible = (element) =>
+                element.getClientRects().length > 0 &&
+                getComputedStyle(element).visibility !== 'hidden';
+            const describe = (element) => ({
+                tag: element.tagName.toLowerCase(),
+                role: element.getAttribute('role'),
+                aria: element.getAttribute('aria-label'),
+                title: element.getAttribute('title'),
+                testId: element.getAttribute('data-testid'),
+                text: (element.innerText || element.textContent || '')
+                    .replace(/\\s+/g, ' ').trim().slice(0, 100),
+                visible: visible(element)
+            });
+            return JSON.stringify({
+                controls: [...document.querySelectorAll(
                     '[role="menuitem"], [role="button"], button'
-                ) || arguments[0];
-                """,
-                element,
-            )
-    return False
+                )].filter(visible).slice(-20).map(describe),
+                fileInputs: [...document.querySelectorAll('input[type="file"]')]
+                    .map((input) => ({
+                        accept: input.getAttribute('accept'),
+                        multiple: input.multiple,
+                        files: [...input.files].map((file) => file.name)
+                    }))
+            });
+            """
+        )
+        return str(diagnostics)
+    except WebDriverException as error:
+        return f"indisponível ({error.msg.splitlines()[0]})"
 
 
 def _click_media_menu_item(driver: webdriver.Chrome) -> None:
-    for _attempt in range(3):
+    def find_and_click(browser: webdriver.Chrome) -> bool:
         try:
-            item = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-                _media_menu_item
+            return bool(
+                browser.execute_script(
+                    """
+                    const labels = [
+                        'fotosevideos',
+                        'photosvideos',
+                        'photosandvideos'
+                    ];
+                    const compactLabel = (value) => (value || '')
+                        .normalize('NFD')
+                        .replace(/[\\u0300-\\u036f]/g, '')
+                        .toLocaleLowerCase()
+                        .replace(/[^a-z0-9]/g, '');
+                    const isVisible = (element) =>
+                        element.getClientRects().length > 0 &&
+                        getComputedStyle(element).visibility !== 'hidden';
+                    const labelText = (element) => [
+                        element.innerText,
+                        element.textContent,
+                        element.getAttribute('aria-label'),
+                        element.getAttribute('title')
+                    ].filter(Boolean).map(compactLabel).join(' ');
+                    const matches = (element) => {
+                        const text = labelText(element);
+                        return labels.some((label) => text.includes(label));
+                    };
+                    const controls = [...document.querySelectorAll(
+                        '[role="menuitem"], [role="button"], button, ' +
+                        '[data-testid*="attach"], [data-testid*="media"]'
+                    )].filter((element) => isVisible(element) && matches(element));
+                    controls.sort((left, right) =>
+                        labelText(left).length - labelText(right).length
+                    );
+                    if (controls.length) {
+                        controls[0].click();
+                        return true;
+                    }
+                    const textNodes = [...document.querySelectorAll('div, span')]
+                        .filter((element) => isVisible(element) && matches(element))
+                        .sort((left, right) =>
+                            labelText(left).length - labelText(right).length
+                        );
+                    if (!textNodes.length) return false;
+                    const target = textNodes[0].closest(
+                        '[role="menuitem"], [role="button"], button'
+                    ) || textNodes[0];
+                    target.click();
+                    return true;
+                    """
+                )
             )
-            if not item:
-                raise TimeoutException("A opção Fotos e vídeos não apareceu.")
-            driver.execute_script("arguments[0].click()", item)
-            return
         except StaleElementReferenceException:
-            continue
-    raise TimeoutException(
-        "O menu de mídia foi atualizado repetidamente antes de selecionar "
-        "Fotos e vídeos."
-    )
+            return False
+
+    try:
+        WebDriverWait(driver, MEDIA_MENU_TIMEOUT_SECONDS).until(find_and_click)
+    except TimeoutException as error:
+        raise TimeoutException(
+            "A opção Fotos e vídeos não apareceu ou não pôde ser selecionada "
+            "no menu de anexos. Elementos visíveis: "
+            f"{_media_menu_diagnostics(driver)}"
+        ) from error
+
+
+def _click_attachment_button(driver: webdriver.Chrome) -> None:
+    def find_and_click(browser: webdriver.Chrome) -> bool:
+        try:
+            return bool(
+                browser.execute_script(
+                    """
+                    const normalize = (value) =>
+                        (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (element) =>
+                        element.getClientRects().length > 0 &&
+                        getComputedStyle(element).visibility !== 'hidden';
+                    for (const button of document.querySelectorAll(
+                        'button, [role="button"]'
+                    )) {
+                        if (!isVisible(button)) continue;
+                        const label = normalize([
+                            button.innerText,
+                            button.getAttribute('aria-label'),
+                            button.getAttribute('title'),
+                            button.getAttribute('data-testid')
+                        ].filter(Boolean).join(' '));
+                        if (!/(attach|anexar|clip|anexo)/i.test(label)) continue;
+                        button.click();
+                        return true;
+                    }
+                    return false;
+                    """
+                )
+            )
+        except StaleElementReferenceException:
+            return False
+
+    try:
+        WebDriverWait(driver, MEDIA_MENU_TIMEOUT_SECONDS).until(find_and_click)
+    except TimeoutException as error:
+        raise TimeoutException(
+            "O botão de anexos não apareceu ou não pôde ser selecionado."
+        ) from error
+
+
+def _click_document_menu_item(driver: webdriver.Chrome) -> None:
+    def find_and_click(browser: webdriver.Chrome) -> bool:
+        try:
+            return bool(
+                browser.execute_script(
+                    """
+                    const normalize = (value) =>
+                        (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (element) =>
+                        element.getClientRects().length > 0 &&
+                        getComputedStyle(element).visibility !== 'hidden';
+                    for (const element of document.querySelectorAll(
+                        '[role="menuitem"], [role="button"], button, div, span'
+                    )) {
+                        if (!isVisible(element)) continue;
+                        const label = normalize([
+                            element.innerText,
+                            element.getAttribute('aria-label'),
+                            element.getAttribute('title')
+                        ].filter(Boolean).join(' '));
+                        if (label !== 'documento' && label !== 'document') continue;
+                        const target = element.closest(
+                            '[role="menuitem"], [role="button"], button'
+                        ) || element;
+                        target.click();
+                        return true;
+                    }
+                    return false;
+                    """
+                )
+            )
+        except StaleElementReferenceException:
+            return False
+
+    try:
+        WebDriverWait(driver, MEDIA_MENU_TIMEOUT_SECONDS).until(find_and_click)
+    except TimeoutException as error:
+        raise TimeoutException(
+            "A opção Documento não apareceu ou não pôde ser selecionada."
+        ) from error
 
 
 def _send_images_with_caption(
@@ -661,12 +816,8 @@ def _send_images_with_caption(
     before_upload = ""
     selected_input = ""
     try:
-        attachment_button = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-            _attachment_button
-        )
-        if not attachment_button:
-            raise TimeoutException("O botão de anexos não apareceu.")
-        driver.execute_script("arguments[0].click()", attachment_button)
+        _wait_for_conversation_compose_box(driver)
+        _click_attachment_button(driver)
 
         stage = "selecionar Fotos e vídeos"
         _click_media_menu_item(driver)
@@ -754,7 +905,11 @@ def _send_images_with_caption(
         driver.execute_script("arguments[0].click()", send_button)
         stage = "confirmar o envio das imagens"
         WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-            lambda browser: not _media_dialog(browser)
+            lambda browser: (
+                _conversation_compose_box(browser)
+                if not _media_dialog(browser)
+                else False
+            )
         )
     except TimeoutException as error:
         details = (
@@ -794,51 +949,10 @@ def _send_media(
     _send_images_with_caption(driver, images, caption)
 
 
-def _attachment_button(driver: webdriver.Chrome) -> WebElement | bool:
-    for button in driver.find_elements(By.CSS_SELECTOR, "button"):
-        label = " ".join(
-            (
-                button.text or "",
-                button.get_attribute("aria-label") or "",
-                button.get_attribute("title") or "",
-                button.get_attribute("data-testid") or "",
-            )
-        ).casefold()
-        if _visible(button) and any(
-            word in label for word in ("attach", "anexar", "clip", "anexo")
-        ):
-            return button
-    return False
-
-
-def _document_menu_item(driver: webdriver.Chrome) -> WebElement | bool:
-    for element in driver.find_elements(
-        By.XPATH,
-        "//*[@role='menuitem'] | //*[normalize-space(.)='Documento' "
-        "or normalize-space(.)='Document']",
-    ):
-        if _visible(element) and element.text.strip().casefold() in {
-            "documento",
-            "document",
-        }:
-            return element
-    return False
-
-
 def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
     try:
-        attach = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-            _attachment_button
-        )
-        if not attach:
-            raise TimeoutException("O botão de anexar arquivo não apareceu.")
-        driver.execute_script("arguments[0].click()", attach)
-        document_item = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-            _document_menu_item
-        )
-        if not document_item:
-            raise TimeoutException("A opção Documento não apareceu.")
-        driver.execute_script("arguments[0].click()", document_item)
+        _click_attachment_button(driver)
+        _click_document_menu_item(driver)
         file_input = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
             lambda browser: _find_file_input(browser, images_only=False)
         )

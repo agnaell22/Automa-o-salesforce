@@ -48,6 +48,7 @@ from salesforce import (
 from whatsapp import (
     _note_message,
     _find_file_input,
+    _click_attachment_button,
     _click_media_menu_item,
     _media_dialog,
     _open_group,
@@ -655,43 +656,91 @@ class SalesforceNavigationTests(unittest.TestCase):
 
 
 class WhatsAppDeliveryTests(unittest.TestCase):
-    def test_retries_media_menu_lookup_when_element_reference_is_stale(self):
+    def test_retries_fresh_attachment_button_lookup_after_stale_dom(self):
         driver = Mock()
-        media_item = Mock()
-        wait = Mock(until=lambda condition: condition(driver))
-
-        with (
-            patch(
-                "whatsapp._media_menu_item",
-                side_effect=[StaleElementReferenceException(), media_item],
-            ) as find_item,
-            patch("whatsapp.WebDriverWait", return_value=wait),
-        ):
-            _click_media_menu_item(driver)
-
-        self.assertEqual(find_item.call_count, 2)
-        driver.execute_script.assert_called_once_with(
-            "arguments[0].click()",
-            media_item,
-        )
-
-    def test_retries_media_menu_click_when_element_becomes_stale(self):
-        driver = Mock()
-        media_item = Mock()
         driver.execute_script.side_effect = [
             StaleElementReferenceException(),
-            None,
+            False,
+            True,
         ]
-        wait = Mock(until=lambda condition: condition(driver))
+
+        class ImmediateWait:
+            def __init__(self, _driver, _timeout):
+                pass
+
+            def until(self, condition):
+                for _ in range(3):
+                    if condition(driver):
+                        return True
+                raise AssertionError("Expected attachment button to appear.")
+
+        with patch("whatsapp.WebDriverWait", ImmediateWait):
+            _click_attachment_button(driver)
+
+        self.assertEqual(driver.execute_script.call_count, 3)
+        self.assertTrue(
+            all(
+                "button.click()" in call.args[0] and len(call.args) == 1
+                for call in driver.execute_script.call_args_list
+            )
+        )
+
+    def test_selects_media_menu_item_with_fresh_dom_lookup(self):
+        driver = Mock()
+        driver.execute_script.side_effect = [
+            StaleElementReferenceException(),
+            False,
+            True,
+        ]
+
+        class ImmediateWait:
+            def __init__(self, _driver, _timeout):
+                pass
+
+            def until(self, condition):
+                for _ in range(3):
+                    if condition(driver):
+                        return True
+                raise AssertionError("Expected menu item to become available.")
 
         with (
-            patch("whatsapp._media_menu_item", return_value=media_item) as find_item,
-            patch("whatsapp.WebDriverWait", return_value=wait),
+            patch("whatsapp.WebDriverWait", ImmediateWait),
         ):
             _click_media_menu_item(driver)
 
-        self.assertEqual(find_item.call_count, 2)
-        self.assertEqual(driver.execute_script.call_count, 2)
+        self.assertEqual(driver.execute_script.call_count, 3)
+        self.assertTrue(
+            all(
+                "controls[0].click()" in call.args[0]
+                and "text.includes(label)" in call.args[0]
+                and len(call.args) == 1
+                for call in driver.execute_script.call_args_list
+            )
+        )
+
+    def test_media_menu_timeout_is_actionable(self):
+        driver = Mock()
+        driver.execute_script.return_value = False
+
+        class ImmediateWait:
+            def __init__(self, _driver, _timeout):
+                pass
+
+            def until(self, condition):
+                for _ in range(2):
+                    condition(driver)
+                raise TimeoutException()
+
+        with (
+            patch("whatsapp.WebDriverWait", ImmediateWait),
+        ):
+            with self.assertRaisesRegex(
+                TimeoutException, "não apareceu ou não pôde ser selecionada"
+            ) as raised:
+                _click_media_menu_item(driver)
+
+        self.assertEqual(driver.execute_script.call_count, 3)
+        self.assertIn("Elementos visíveis", str(raised.exception))
 
     def test_photo_upload_prefers_image_and_video_input_over_image_only(self):
         image_input = Mock()
@@ -979,8 +1028,6 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             for image in images:
                 image.write_bytes(b"original image")
             driver = Mock()
-            attach_button = Mock()
-            photo_video_item = Mock()
             file_input = Mock()
             file_input.get_property.return_value = True
             dialog = Mock()
@@ -992,15 +1039,11 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             media_dialog_calls = iter([dialog, dialog, dialog, False])
 
             with (
-                patch(
-                    "whatsapp._attachment_button",
-                    return_value=attach_button,
-                ),
-                patch(
-                    "whatsapp._media_menu_item",
-                    return_value=photo_video_item,
-                ),
+                patch("whatsapp._click_attachment_button"),
+                patch("whatsapp._wait_for_conversation_compose_box"),
+                patch("whatsapp._click_media_menu_item"),
                 patch("whatsapp._find_file_input", return_value=file_input),
+                patch("whatsapp._conversation_compose_box", return_value=Mock()),
                 patch(
                     "whatsapp._media_dialog",
                     side_effect=lambda _driver: next(media_dialog_calls),
@@ -1023,11 +1066,7 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                 for call in driver.execute_script.call_args_list
                 if call.args[0] == "arguments[0].click()"
             ],
-            [
-                unittest.mock.call("arguments[0].click()", attach_button),
-                unittest.mock.call("arguments[0].click()", photo_video_item),
-                unittest.mock.call("arguments[0].click()", send_button),
-            ],
+            [unittest.mock.call("arguments[0].click()", send_button)],
         )
         file_input.send_keys.assert_called_once_with(
             "\n".join(str(image.resolve()) for image in images)
@@ -1048,26 +1087,19 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                     if call.args[0] == "arguments[0].click()"
                 ]
             ),
-            3,
+            1,
         )
 
     def test_multiple_photos_fail_before_upload_if_input_lacks_multiple(self):
         with tempfile.TemporaryDirectory() as directory:
             images = [Path(directory) / "one.jpg", Path(directory) / "two.jpg"]
             driver = Mock()
-            attach_button = Mock()
-            photo_video_item = Mock()
             file_input = Mock()
             file_input.get_property.return_value = False
             with (
-                patch(
-                    "whatsapp._attachment_button",
-                    return_value=attach_button,
-                ),
-                patch(
-                    "whatsapp._media_menu_item",
-                    return_value=photo_video_item,
-                ),
+                patch("whatsapp._click_attachment_button"),
+                patch("whatsapp._wait_for_conversation_compose_box"),
+                patch("whatsapp._click_media_menu_item"),
                 patch("whatsapp._find_file_input", return_value=file_input),
             ):
                 with self.assertRaisesRegex(
@@ -1081,8 +1113,6 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         self.assertFalse(
             any(
                 call.args[0] == "arguments[0].click()"
-                and call.args[1] is not attach_button
-                and call.args[1] is not photo_video_item
                 for call in driver.execute_script.call_args_list
             )
         )
@@ -1092,8 +1122,6 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             image = Path(directory) / "foto.jpg"
             image.write_bytes(b"original image")
             driver = Mock()
-            attach_button = Mock()
-            photo_video_item = Mock()
             file_input = Mock()
             file_input.get_property.return_value = True
             media_editor = Mock()
@@ -1110,14 +1138,9 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                     return result
 
             with (
-                patch(
-                    "whatsapp._attachment_button",
-                    return_value=attach_button,
-                ),
-                patch(
-                    "whatsapp._media_menu_item",
-                    return_value=photo_video_item,
-                ),
+                patch("whatsapp._click_attachment_button"),
+                patch("whatsapp._wait_for_conversation_compose_box"),
+                patch("whatsapp._click_media_menu_item"),
                 patch("whatsapp._find_file_input", return_value=file_input),
                 patch("whatsapp._media_dialog", return_value=media_editor),
                 patch("whatsapp._media_preview_diagnostics", return_value="{}"),
@@ -1133,7 +1156,6 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         self.assertFalse(
             any(
                 call.args[0] == "arguments[0].click()"
-                and call.args[1] not in (attach_button, photo_video_item)
                 for call in driver.execute_script.call_args_list
             )
         )
@@ -1219,6 +1241,91 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                     DEFAULT_WHATSAPP_GROUP,
                     input_fn=lambda _prompt: self.fail(
                         "Already delivered content must not request confirmation."
+                    ),
+                )
+
+            create_browser.assert_not_called()
+
+    def test_resumes_after_partial_failure_without_duplicating_sent_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "Respostas"
+            report_rows = {}
+            for note in ("123", "456"):
+                note_dir = output_dir / note
+                note_dir.mkdir(parents=True)
+                (note_dir / "descricao.txt").write_text(
+                    f"Nota: {note}\n",
+                    encoding="utf-8",
+                )
+                (note_dir / f"{note}_foto.jpg").write_bytes(
+                    f"image {note}".encode()
+                )
+                report_rows[note] = {
+                    "status": "Concluída",
+                    "motivo_nao_conclusao": "",
+                }
+
+            first_driver = Mock()
+            resume_driver = Mock()
+            with (
+                patch(
+                    "whatsapp._create_browser",
+                    return_value=first_driver,
+                ),
+                patch("whatsapp._wait_for_search_input"),
+                patch("whatsapp._open_group"),
+                patch(
+                    "whatsapp._send_media",
+                    side_effect=[None, RuntimeError("falha simulada")],
+                ) as first_run_send,
+                patch("whatsapp._send_document"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "falha simulada"):
+                    enviar_respostas(
+                        output_dir,
+                        report_rows,
+                        DEFAULT_WHATSAPP_GROUP,
+                        input_fn=lambda _prompt: "s",
+                    )
+
+            self.assertEqual(first_run_send.call_count, 2)
+            first_driver.quit.assert_called_once()
+
+            with (
+                patch(
+                    "whatsapp._create_browser",
+                    return_value=resume_driver,
+                ),
+                patch("whatsapp._wait_for_search_input"),
+                patch("whatsapp._open_group"),
+                patch("whatsapp._send_media") as resume_send,
+                patch("whatsapp._send_document") as send_document,
+            ):
+                enviar_respostas(
+                    output_dir,
+                    report_rows,
+                    DEFAULT_WHATSAPP_GROUP,
+                    input_fn=lambda _prompt: "s",
+                )
+
+            self.assertEqual(resume_send.call_count, 1)
+            self.assertEqual(
+                resume_send.call_args.args[1],
+                [output_dir / "456" / "456_foto.jpg"],
+            )
+            send_document.assert_called_once_with(
+                resume_driver, root / "Respostas.zip"
+            )
+            resume_driver.quit.assert_called_once()
+
+            with patch("whatsapp._create_browser") as create_browser:
+                enviar_respostas(
+                    output_dir,
+                    report_rows,
+                    DEFAULT_WHATSAPP_GROUP,
+                    input_fn=lambda _prompt: self.fail(
+                        "Identical notes and ZIP must not be sent again."
                     ),
                 )
 
