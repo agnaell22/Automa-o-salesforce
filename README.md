@@ -26,15 +26,47 @@ Os caminhos podem ser substituídos por argumentos:
 python automacao.py --planilha "C:\caminho\notas.xlsx" --aba "Notas sem evidências" --coluna "Nota" --saida "C:\caminho\Respostas"
 ```
 
+### Interface desktop
+
+No Windows, abra a interface gráfica com:
+
+```powershell
+python interface.py
+```
+
+Na janela, selecione a planilha e a pasta de respostas; ajuste a aba, a coluna
+da nota e o limite de consultas; depois escolha se deseja consultar o Salesforce
+e/ou enviar pelo WhatsApp. O campo **Nome exato do grupo WhatsApp** pode ser
+alterado antes de iniciar. Quando o envio estiver habilitado, a interface pede
+confirmação mostrando o grupo escolhido. O andamento e os erros aparecem na
+própria janela, e o botão **Abrir relatório** abre o CSV após sua criação.
+O login do Salesforce e a leitura do QR Code do WhatsApp continuam sendo feitos
+nas janelas dedicadas do Chrome.
+
+Para gerar o executável Windows e colocá-lo na Área de Trabalho, instale as
+dependências de empacotamento uma vez e execute o script do projeto:
+
+```powershell
+python -m pip install -r requirements-build.txt
+.\build_windows.ps1
+```
+
+O executável será criado como `Automacao Salesforce.exe` na Área de Trabalho;
+os scripts-fonte permanecem nesta pasta do projeto. O executável inclui o
+Python e as bibliotecas do programa, mas o Chrome continua sendo necessário
+para as automações do Salesforce e WhatsApp. Para gerar uma versão atualizada
+após mudanças no código, execute `.\build_windows.ps1` novamente.
+
 O programa cria uma pasta por nota com `descricao.txt` contendo Texto code
 ação, Código de ação, Data encermto. e CenTrab respon. Também registra esses
 campos, a coluna `UTD` da planilha, o status, o motivo, os arquivos baixados e
 erros em `relatorio_processamento.csv`, que abre no Excel. Notas repetidas são
-processadas uma única vez. Resultados já registrados são preservados quando a
-fila é gerada novamente.
-Mantenha esse CSV fechado no Excel durante consultas ao Salesforce, pois os
-resultados são gravados progressivamente. No modo somente WhatsApp, um relatório
-existente é lido sem ser regravado.
+processadas uma única vez. A cada execução, as notas da planilha são comparadas
+com o relatório: notas que ainda não existem são acrescentadas com status
+`Pendente`, e todas as linhas e resultados anteriores são preservados mesmo se
+uma nota deixar de constar na planilha. Descrições já existentes não são
+sobrescritas durante a sincronização. Mantenha esse CSV fechado no Excel durante
+consultas ao Salesforce, pois os resultados são gravados progressivamente.
 
 ## Consultar uma nota no Salesforce
 
@@ -80,12 +112,12 @@ Para consultar mais notas, aumente o limite explicitamente:
 python automacao.py --consultar-salesforce --limite 10
 ```
 
-O limite conta somente notas ainda não concluídas. Nas execuções seguintes,
-notas com status `Concluída` ou `Sem imagens` são ignoradas; notas pendentes,
-com erro ou parciais podem ser tentadas novamente. Cada resultado é salvo no
-relatório assim que a nota termina, permitindo retomar a fila sem reprocessar
-as notas já concluídas. Se não houver notas para processar, o Chrome não será
-aberto.
+O limite conta somente notas ainda não concluídas. Notas novas são priorizadas;
+notas com status `Concluída` ou `Sem imagens` são ignoradas, enquanto notas
+antigas pendentes, com erro ou parciais podem ser tentadas novamente. Cada
+resultado é salvo no relatório assim que a nota termina, permitindo retomar a
+fila sem reprocessar as notas já concluídas. Se não houver notas para processar,
+o Chrome não será aberto.
 
 Os downloads dependem do acesso do Chrome aos arquivos do Salesforce e podem
 falhar se a rede ou a sessão da organização bloquear os arquivos. Erros são
@@ -104,16 +136,17 @@ python automacao.py --enviar-whatsapp
 O Chrome usa um perfil separado em
 `%LOCALAPPDATA%\SalesforceAutomation\WhatsAppProfile`. Na primeira execução,
 leia manualmente o QR Code do WhatsApp Web. O programa procura o grupo pelo
-nome exato `Teste Geoex` (padrão) e pede confirmação no terminal
+nome exato informado (padrão: `Pendências Geoex - Metropolitana`) e pede confirmação no terminal
 uma vez antes de iniciar os envios. Após a confirmação, as notas e o ZIP são
 enviados automaticamente, sem confirmações individuais. Só são publicadas
 notas com status `Concluída` e imagens; notas sem imagens, pendentes ou com
-erro não são publicadas individualmente. Todas as imagens de cada nota são
-anexadas juntas pelo menu `Fotos e vídeos` como fotos originais, e a descrição
-combinada com o motivo de impedimento, quando preenchido, é enviada como legenda
-na mesma mensagem. Se o WhatsApp não aceitar o lote de imagens ou não oferecer
-o campo de legenda, o envio da nota é interrompido; a descrição não é enviada
-separadamente.
+erro não são publicadas individualmente. Uma imagem é anexada pelo seletor de
+arquivo de fotos já disponível na conversa, evitando depender da abertura do
+menu de anexos; várias imagens são anexadas juntas pelo menu `Fotos e vídeos`
+como fotos originais. A descrição combinada com o motivo de impedimento, quando
+preenchido, é enviada como legenda na mesma mensagem. Se o WhatsApp não aceitar
+o lote de imagens ou não oferecer o campo de legenda, o envio da nota é
+interrompido; a descrição não é enviada separadamente.
 
 Também é possível consultar o Salesforce e enviar no mesmo comando:
 
@@ -127,9 +160,13 @@ Use `--grupo-whatsapp "Nome exato do grupo"` para escolher outro grupo ou
 de si mesmo. Um registro local fora da pasta guarda os envios confirmados:
 conteúdo idêntico já enviado não é publicado novamente; notas ou arquivos
 alterados podem ser enviados novamente. Para o ZIP, o envio só é confirmado
-quando a mensagem aparece no grupo com o indicador de envio concluído; essa
-confirmação pode levar até cinco minutos. Estados antigos sem essa confirmação
-serão tratados como não verificados e o ZIP será enviado novamente uma vez.
+quando uma nova mensagem com o nome do arquivo aparece no grupo e tem um
+indicador acessível de envio concluído. A automação aguarda até cinco minutos;
+se não conseguir confirmar, informa as mensagens observadas, não marca o ZIP
+como enviado e encerra o navegador. Estados antigos sem essa confirmação serão
+tratados como não verificados e o ZIP será enviado novamente uma vez.
+Após confirmar o envio do ZIP e salvar o estado, o navegador é encerrado
+automaticamente e o comando termina.
 
 O programa não envia credenciais nem acessa uma API externa do WhatsApp; a
 sessão permanece no perfil local do Chrome. Confirme cuidadosamente o grupo e

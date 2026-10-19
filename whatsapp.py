@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import tempfile
+import unicodedata
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -24,7 +25,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 LOGIN_TIMEOUT_SECONDS = 300
 PAGE_TIMEOUT_SECONDS = 30
 DOCUMENT_SEND_TIMEOUT_SECONDS = 300
-CAPTION_FIELD_TIMEOUT_SECONDS = 3
+CAPTION_FIELD_TIMEOUT_SECONDS = 10
 MEDIA_MENU_TIMEOUT_SECONDS = 10
 SUCCESSFUL_SALESFORCE_STATUSES = frozenset({"Concluída"})
 WHATSAPP_STATE_VERSION = 2
@@ -243,6 +244,15 @@ def _xpath_literal(value: str) -> str:
     return "concat(" + ', "\'", '.join(f"'{part}'" for part in parts) + ")"
 
 
+def _normalized_group_text(value: str) -> str:
+    visible_text = "".join(
+        character
+        for character in value
+        if unicodedata.category(character) != "Cf"
+    )
+    return " ".join(visible_text.split()).casefold()
+
+
 def _open_group(driver: webdriver.Chrome, group_name: str) -> None:
     search_input = _wait_for_search_input(driver)
     try:
@@ -251,33 +261,41 @@ def _open_group(driver: webdriver.Chrome, group_name: str) -> None:
         driver.execute_script("arguments[0].focus()", search_input)
     search_input.send_keys(Keys.CONTROL, "a")
     search_input.send_keys(group_name)
-    literal = _xpath_literal(group_name)
-
     def matching_result(browser: webdriver.Chrome) -> WebElement | bool:
-        result_queries = (
-            "//*[@data-testid='cell-frame-container' or @role='listitem']"
-            f"[contains(@title, {literal}) or contains(@aria-label, {literal}) "
-            f"or contains(normalize-space(.), {literal}) "
-            f"or .//*[contains(@title, {literal}) "
-            f"or contains(@aria-label, {literal}) "
-            f"or contains(normalize-space(.), {literal})]]",
-            "//*[contains(@title, "
-            f"{literal}) or contains(@aria-label, {literal}) "
-            f"or contains(normalize-space(.), {literal})]",
+        expected_name = _normalized_group_text(group_name)
+        rows = browser.find_elements(
+            By.CSS_SELECTOR,
+            "[data-testid='cell-frame-container'], [role='listitem'], [role='row']",
         )
-        for query in result_queries:
-            for element in browser.find_elements(By.XPATH, query):
-                if _visible(element):
-                    row = browser.execute_script(
-                        """
-                        return arguments[0].closest(
-                            '[data-testid="cell-frame-container"], [role="listitem"]'
-                        ) || arguments[0];
-                        """,
-                        element,
+        for row in rows:
+            try:
+                if not _visible(row):
+                    continue
+                labels = [
+                    row.text or "",
+                    row.get_attribute("title") or "",
+                    row.get_attribute("aria-label") or "",
+                ]
+                labels.extend(
+                    element.text or ""
+                    for element in row.find_elements(
+                        By.CSS_SELECTOR,
+                        "[data-testid='cell-frame-title'], [title], [aria-label]",
                     )
-                    if row and _visible(row):
-                        return row
+                    if _visible(element)
+                )
+                if any(
+                    expected_name
+                    in {
+                        _normalized_group_text(line)
+                        for line in label.splitlines()
+                        if line.strip()
+                    }
+                    for label in labels
+                ):
+                    return row
+            except StaleElementReferenceException:
+                continue
         return False
 
     try:
@@ -332,12 +350,10 @@ def _open_group(driver: webdriver.Chrome, group_name: str) -> None:
         try:
             WebDriverWait(driver, 3).until(matching_header)
         except TimeoutException:
-            driver.execute_script(
-                "arguments[0].click();",
-                result,
-            )
             try:
-                WebDriverWait(driver, 5).until(matching_header)
+                WebDriverWait(driver, PAGE_TIMEOUT_SECONDS - 3).until(
+                    matching_header
+                )
             except TimeoutException:
                 diagnostics = driver.execute_script(
                     """
@@ -403,9 +419,6 @@ def _find_file_input(
 
 
 def _media_dialog(driver: webdriver.Chrome) -> WebElement | bool:
-    for dialog in driver.find_elements(By.XPATH, "//*[@role='dialog']"):
-        if _visible(dialog):
-            return dialog
     for preview in driver.find_elements(
         By.CSS_SELECTOR,
         "[data-testid*='media-editor'], [data-testid*='media-preview']",
@@ -445,6 +458,10 @@ def _media_dialog(driver: webdriver.Chrome) -> WebElement | bool:
                 return editor
         elif _send_button(preview):
             return preview
+
+    for dialog in driver.find_elements(By.XPATH, "//*[@role='dialog']"):
+        if _visible(dialog) and _send_button(dialog):
+            return dialog
 
     caption_labels = ("legenda", "caption")
     for element in driver.find_elements(
@@ -537,6 +554,43 @@ def _conversation_compose_box(driver: webdriver.Chrome) -> WebElement | bool:
     return False
 
 
+def _media_caption_box(driver: webdriver.Chrome) -> WebElement | bool:
+    candidates = driver.find_elements(
+        By.CSS_SELECTOR,
+        "[data-testid='media-caption-input-container'], "
+        "[contenteditable='true'], textarea, [data-placeholder]",
+    )
+    ranked_candidates: list[tuple[int, WebElement]] = []
+    for element in candidates:
+        if not _visible(element):
+            continue
+        test_id = element.get_attribute("data-testid") or ""
+        if test_id == "conversation-compose-box-input":
+            continue
+        aria_label = (element.get_attribute("aria-label") or "").strip().casefold()
+        placeholder = " ".join(
+            (
+                element.get_attribute("placeholder") or "",
+                element.get_attribute("data-placeholder") or "",
+            )
+        ).strip().casefold()
+        if test_id == "media-caption-input-container":
+            rank = 0
+        elif aria_label == "digite uma mensagem":
+            rank = 1
+        elif any(
+            word in f"{aria_label} {placeholder}"
+            for word in ("caption", "legenda")
+        ):
+            rank = 2
+        else:
+            continue
+        ranked_candidates.append((rank, element))
+    if ranked_candidates:
+        return min(ranked_candidates, key=lambda candidate: candidate[0])[1]
+    return False
+
+
 def _wait_for_conversation_compose_box(driver: webdriver.Chrome) -> None:
     compose_box = WebDriverWait(driver, MEDIA_MENU_TIMEOUT_SECONDS).until(
         _conversation_compose_box
@@ -616,7 +670,8 @@ def _media_preview_diagnostics(driver: webdriver.Chrome) -> str:
 def _send_button(dialog: WebElement) -> WebElement | bool:
     for button in dialog.find_elements(
         By.CSS_SELECTOR,
-        "button, [role='button'], [data-testid*='send'], [data-icon='send']",
+        "button, [role='button'], [aria-label*='Enviar'], "
+        "[aria-label*='Send'], [data-testid*='send'], [data-icon='send']",
     ):
         icon_labels = " ".join(
             icon.get_attribute("data-icon") or ""
@@ -834,15 +889,20 @@ def _send_images_with_caption(
     selected_input = ""
     try:
         _wait_for_conversation_compose_box(driver)
-        _click_attachment_button(driver)
-
-        stage = "selecionar Fotos e vídeos"
-        _click_media_menu_item(driver)
-
-        stage = "localizar o seletor de fotos"
-        file_input = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-            lambda browser: _find_file_input(browser, images_only=True)
+        file_input = (
+            _find_file_input(driver, images_only=True)
+            if len(images) == 1
+            else False
         )
+        if not file_input:
+            _click_attachment_button(driver)
+            stage = "selecionar Fotos e vídeos"
+            _click_media_menu_item(driver)
+
+            stage = "localizar o seletor de fotos"
+            file_input = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
+                lambda browser: _find_file_input(browser, images_only=True)
+            )
         supports_multiple = bool(file_input.get_property("multiple"))
         if len(images) > 1 and not supports_multiple:
             raise RuntimeError(
@@ -876,22 +936,7 @@ def _send_images_with_caption(
             stage = "localizar o campo da descrição"
 
             def caption_box_ready(browser: webdriver.Chrome) -> WebElement | bool:
-                active_dialog = _media_dialog(browser)
-                if not active_dialog:
-                    return False
-                return next(
-                    (
-                        element
-                        for element in active_dialog.find_elements(
-                            By.CSS_SELECTOR,
-                            "[contenteditable='true'], textarea, [data-placeholder]",
-                        )
-                        if _visible(element)
-                        and element.get_attribute("data-testid")
-                        != "conversation-compose-box-input"
-                    ),
-                    False,
-                )
+                return _media_caption_box(browser)
 
             caption_box = WebDriverWait(
                 driver, CAPTION_FIELD_TIMEOUT_SECONDS
@@ -988,7 +1033,7 @@ def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
             raise TimeoutException("O botão de envio do ZIP não apareceu.")
         existing_message_ids = {
             message["id"]
-            for message in _document_message_states(driver)
+            for message in _document_message_states(driver, archive_path.name)
             if message["id"]
         }
         driver.execute_script("arguments[0].click()", send_button)
@@ -1010,33 +1055,55 @@ def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
 
 def _document_message_states(
     driver: webdriver.Chrome,
+    archive_name: str,
 ) -> list[dict[str, str | bool]]:
     messages = driver.execute_script(
         """
         const visible = (element) =>
             element.getClientRects().length > 0 &&
             getComputedStyle(element).visibility !== 'hidden';
+        const archiveName = arguments[0].toLocaleLowerCase();
         return [...document.querySelectorAll('[data-testid="msg-container"]')]
             .filter(visible)
             .map((message) => {
                 const statusLabels = [
-                    ...message.querySelectorAll('[data-icon], [data-testid]')
+                    ...message.querySelectorAll(
+                        '[data-icon], [data-testid], [aria-label], [title]'
+                    )
                 ].map((element) => [
                     element.getAttribute('data-icon'),
-                    element.getAttribute('data-testid')
+                    element.getAttribute('data-testid'),
+                    element.getAttribute('aria-label'),
+                    element.getAttribute('title'),
+                    element.className
                 ].filter(Boolean).join(' ').toLowerCase());
+                const messageText = [
+                    message.innerText,
+                    message.textContent,
+                    ...[...message.querySelectorAll(
+                        '[data-testid="document-thumb"], [title], [aria-label]'
+                    )].flatMap((element) => [
+                        element.innerText,
+                        element.textContent,
+                        element.getAttribute('title'),
+                        element.getAttribute('aria-label')
+                    ])
+                ].filter(Boolean).join(' ').toLocaleLowerCase();
                 return {
                     id: message.getAttribute('data-id') ||
                         message.querySelector('[data-id]')?.getAttribute('data-id') || '',
+                    hasDocument: messageText.includes(archiveName),
                     sent: statusLabels.some((label) =>
-                        /msg-(?:dbl)?check(?:\\b|-)/.test(label))
+                        /msg-(?:dbl)?check(?:\\b|-)|msg-ack|double\\s*check|single\\s*check|enviad[oa]s?|entregue|read|lido[as]?/.test(label))
                 };
             });
         """,
+        archive_name,
     )
     if not isinstance(messages, list) or any(
         not isinstance(message, dict)
         or not isinstance(message.get("id"), str)
+        or not isinstance(message.get("hasDocument"), bool)
         or not isinstance(message.get("sent"), bool)
         for message in messages
     ):
@@ -1056,8 +1123,10 @@ def _wait_for_document_sent(
         if _media_dialog(browser):
             return False
         return any(
-            message["id"] not in previous_message_ids and message["sent"]
-            for message in _document_message_states(browser)
+            message["id"] not in previous_message_ids
+            and message["hasDocument"]
+            and message["sent"]
+            for message in _document_message_states(browser, archive_path.name)
             if message["id"]
         )
 
@@ -1066,10 +1135,21 @@ def _wait_for_document_sent(
             is_document_sent
         )
     except TimeoutException as error:
+        messages = _document_message_states(driver, archive_path.name)
+        new_messages = [
+            {
+                "id": message["id"],
+                "hasDocument": message["hasDocument"],
+                "sent": message["sent"],
+            }
+            for message in messages
+            if message["id"] and message["id"] not in previous_message_ids
+        ]
         raise RuntimeError(
             f"O WhatsApp Web não confirmou o envio de '{archive_path.name}' "
             f"em {DOCUMENT_SEND_TIMEOUT_SECONDS} segundos. O ZIP não foi "
-            "marcado como enviado; verifique o grupo e tente novamente."
+            "marcado como enviado; verifique o grupo e tente novamente. "
+            f"Mensagens novas observadas: {new_messages}"
         ) from error
 
 
@@ -1099,6 +1179,7 @@ def enviar_respostas(
     group_name: str,
     profile_dir: Path | None = None,
     input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
 ) -> None:
     group_name = group_name.strip()
     if not group_name:
@@ -1125,7 +1206,7 @@ def enviar_respostas(
             else []
         )
         if not images:
-            print(f"WhatsApp: nota {note} ignorada (sem imagens).")
+            output_fn(f"WhatsApp: nota {note} ignorada (sem imagens).")
             continue
         message = _note_message(note_dir / "descricao.txt", row)
         fingerprint = _note_fingerprint(note, message, images)
@@ -1134,7 +1215,7 @@ def enviar_respostas(
 
     archive_pending = state.get("archive_sha256") != archive_hash
     if not pending_notes and not archive_pending:
-        print("WhatsApp: notas e ZIP já enviados; nenhum envio duplicado.")
+        output_fn("WhatsApp: notas e ZIP já enviados; nenhum envio duplicado.")
         return
 
     driver = _create_browser(profile_dir)
@@ -1148,20 +1229,20 @@ def enviar_respostas(
             f"Confirme que o grupo aberto é '{group_name}' e autorize os envios",
             input_fn,
         ):
-            print("WhatsApp: envios cancelados.")
+            output_fn("WhatsApp: envios cancelados.")
             return
 
         for note, message, images, fingerprint in pending_notes:
             _send_media(driver, images, message)
             sent_notes[note] = fingerprint
             _save_state(state_path, state)
-            print(f"WhatsApp: nota {note} enviada.")
+            output_fn(f"WhatsApp: nota {note} enviada.")
 
         if archive_pending:
             _send_document(driver, archive_path)
             state["archive_sha256"] = archive_hash
             _save_state(state_path, state)
-            print("WhatsApp: ZIP de Respostas enviado.")
+            output_fn("WhatsApp: ZIP de Respostas enviado.")
     except WebDriverException as error:
         raise RuntimeError(
             "Falha do navegador durante o envio pelo WhatsApp Web: "

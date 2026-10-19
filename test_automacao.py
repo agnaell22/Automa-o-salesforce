@@ -16,6 +16,7 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.common.keys import Keys
 
+from interface import build_cli_args
 from automacao import (
     DEFAULT_WHATSAPP_GROUP,
     LEGACY_REPORT_FIELDS,
@@ -25,6 +26,7 @@ from automacao import (
     normalize_note,
     parse_args,
     prepare_report,
+    read_existing_report,
     select_notes_to_process,
     write_note_descriptions,
     write_report,
@@ -52,7 +54,9 @@ from whatsapp import (
     _click_attachment_button,
     _click_media_menu_item,
     _document_message_states,
+    _media_caption_box,
     _media_dialog,
+    _normalized_group_text,
     _open_group,
     _wait_for_document_sent,
     _send_button,
@@ -62,6 +66,56 @@ from whatsapp import (
     create_responses_archive,
     enviar_respostas,
 )
+
+
+class InterfaceTests(unittest.TestCase):
+    def test_builds_arguments_with_custom_whatsapp_group(self):
+        args = build_cli_args(
+            "C:\\dados\\notas.xlsx",
+            "C:\\dados\\Respostas",
+            "Grupo de teste",
+            "Notas",
+            "Nota",
+            "8",
+            consult_salesforce=True,
+            send_whatsapp=True,
+        )
+
+        self.assertEqual(
+            args,
+            [
+                "--planilha",
+                "C:\\dados\\notas.xlsx",
+                "--aba",
+                "Notas",
+                "--coluna",
+                "Nota",
+                "--saida",
+                "C:\\dados\\Respostas",
+                "--consultar-salesforce",
+                "--limite",
+                "8",
+                "--enviar-whatsapp",
+                "--grupo-whatsapp",
+                "Grupo de teste",
+            ],
+        )
+
+    def test_can_run_without_salesforce_or_whatsapp(self):
+        args = build_cli_args(
+            "notas.xlsx",
+            "Respostas",
+            "",
+            "Notas",
+            "Nota",
+            "1",
+            consult_salesforce=False,
+            send_whatsapp=False,
+        )
+
+        self.assertNotIn("--consultar-salesforce", args)
+        self.assertNotIn("--enviar-whatsapp", args)
+        self.assertNotIn("--grupo-whatsapp", args)
 
 
 class NormalizeNoteTests(unittest.TestCase):
@@ -202,7 +256,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(args.grupo_whatsapp, DEFAULT_WHATSAPP_GROUP)
         self.assertEqual(
             DEFAULT_WHATSAPP_GROUP,
-            "Teste Geoex",
+            "Pendências Geoex - Metropolitana",
         )
         self.assertEqual(args.limite, 100)
 
@@ -221,21 +275,31 @@ class ReportTests(unittest.TestCase):
             ["789", "012"],
         )
 
-    def test_whatsapp_only_reads_existing_report_without_replacing_it(self):
+    def test_prepare_report_appends_new_notes_and_preserves_removed_notes(self):
         with tempfile.TemporaryDirectory() as directory:
             report_path = Path(directory) / "relatorio.csv"
-            write_report(report_path, ["123"], {"123": {"UTD": "CANDEIAS"}})
+            write_report(
+                report_path,
+                ["123", "456"],
+                {"123": {"UTD": "CANDEIAS"}},
+            )
+            rows_before = read_existing_report(report_path)
+            rows_before["123"]["status"] = "Concluída"
+            rows_before["123"]["arquivos_baixados"] = "123_foto.jpg"
+            write_report(report_path, ["123", "456"], rows_before)
 
-            with patch("automacao.write_report") as rewrite_report:
-                rows = prepare_report(
-                    report_path,
-                    ["123"],
-                    {"123": {"UTD": "OUTRO"}},
-                    read_only=True,
-                )
+            rows = prepare_report(
+                report_path,
+                ["456", "789"],
+                {"789": {"UTD": "NOVA"}},
+            )
 
-            rewrite_report.assert_not_called()
-            self.assertEqual(rows["123"]["UTD"], "CANDEIAS")
+            self.assertEqual(list(rows), ["123", "456", "789"])
+            self.assertEqual(rows["123"]["status"], "Concluída")
+            self.assertEqual(rows["123"]["arquivos_baixados"], "123_foto.jpg")
+            self.assertEqual(rows["456"]["status"], "Pendente")
+            self.assertEqual(rows["789"]["status"], "Pendente")
+            self.assertEqual(rows["789"]["UTD"], "NOVA")
 
     def test_report_lock_error_explains_that_excel_must_be_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -281,10 +345,14 @@ class ReportTests(unittest.TestCase):
             with path.open("r", encoding="utf-8-sig", newline="") as report_file:
                 updated = list(csv.DictReader(report_file, delimiter=";"))
 
-            self.assertEqual([row["nota"] for row in updated], ["123", "789"])
+            self.assertEqual(
+                [row["nota"] for row in updated],
+                ["123", "456", "789"],
+            )
             self.assertEqual(updated[0]["status"], "Concluída")
             self.assertEqual(updated[0]["motivo_nao_conclusao"], "Acesso impedido")
             self.assertEqual(updated[1]["status"], "Pendente")
+            self.assertEqual(updated[2]["status"], "Pendente")
 
     def test_applies_salesforce_results_without_losing_other_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -659,25 +727,46 @@ class SalesforceNavigationTests(unittest.TestCase):
 
 
 class WhatsAppDeliveryTests(unittest.TestCase):
-    def test_document_message_lookup_does_not_depend_on_visible_filename(self):
+    def test_document_message_lookup_checks_filename_and_accessible_status(self):
         driver = Mock()
-        expected = [{"id": "message-id", "sent": True}]
+        expected = [
+            {"id": "message-id", "hasDocument": True, "sent": True}
+        ]
         driver.execute_script.return_value = expected
 
-        result = _document_message_states(driver)
+        result = _document_message_states(driver, "Respostas.zip")
 
         self.assertEqual(result, expected)
         script = driver.execute_script.call_args.args[0]
         self.assertIn("[data-testid=\"msg-container\"]", script)
         self.assertIn("msg-(?:dbl)?check", script)
-        self.assertEqual(len(driver.execute_script.call_args.args), 1)
+        self.assertIn("[aria-label]", script)
+        self.assertIn("[title]", script)
+        self.assertEqual(driver.execute_script.call_args.args[1], "Respostas.zip")
 
-    def test_document_send_waits_for_new_message_to_be_marked_sent(self):
+    def test_document_send_waits_for_matching_zip_message_to_be_marked_sent(self):
         driver = Mock()
         archive_path = Path("Respostas.zip")
-        old_message = {"id": "old", "sent": True}
-        pending_message = {"id": "new", "sent": False}
-        sent_message = {"id": "new", "sent": True}
+        old_message = {
+            "id": "old",
+            "hasDocument": True,
+            "sent": True,
+        }
+        other_new_message = {
+            "id": "other",
+            "hasDocument": False,
+            "sent": True,
+        }
+        pending_message = {
+            "id": "new",
+            "hasDocument": True,
+            "sent": False,
+        }
+        sent_message = {
+            "id": "new",
+            "hasDocument": True,
+            "sent": True,
+        }
         wait_timeouts = []
 
         class ImmediateWait:
@@ -698,8 +787,8 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             patch(
                 "whatsapp._document_message_states",
                 side_effect=[
-                    [old_message, pending_message],
-                    [old_message, sent_message],
+                    [old_message, other_new_message, pending_message],
+                    [old_message, other_new_message, sent_message],
                 ],
             ),
             patch("whatsapp.WebDriverWait", ImmediateWait),
@@ -725,7 +814,13 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             patch("whatsapp._media_dialog", return_value=False),
             patch(
                 "whatsapp._document_message_states",
-                return_value=[{"id": "new", "sent": False}],
+                return_value=[
+                    {
+                        "id": "new",
+                        "hasDocument": True,
+                        "sent": False,
+                    }
+                ],
             ),
             patch("whatsapp.WebDriverWait", ImmediateWait),
         ):
@@ -925,6 +1020,12 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             """concat('Grupo "A" d', "'", 'água')""",
         )
 
+    def test_group_text_normalization_removes_whitespace_and_directional_marks(self):
+        self.assertEqual(
+            _normalized_group_text("\u202aTeste   Geoex\u202c"),
+            "teste geoex",
+        )
+
     def test_group_search_falls_back_to_focusing_when_click_is_intercepted(self):
         group_name = "Pendências Geoex - Metropolitana"
         search_input = Mock()
@@ -934,44 +1035,46 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         result = Mock()
         result.is_displayed.return_value = True
         result.click.side_effect = ElementClickInterceptedException(
-            "The row container should be clicked instead."
-        )
-        row = Mock()
-        row.is_displayed.return_value = True
-        row.click.side_effect = ElementClickInterceptedException(
             "Use JavaScript on the result row."
         )
         header = Mock()
         header.get_attribute.return_value = group_name
         driver = Mock()
+        result.text = group_name
+        result.get_attribute.return_value = None
+        result.find_elements.return_value = []
 
         def find_elements(by, selector):
-            if selector.startswith("//*["):
+            if selector == (
+                "[data-testid='cell-frame-container'], [role='listitem'], "
+                "[role='row']"
+            ):
                 return [result]
             if selector.startswith("header "):
                 return [header]
             return []
 
         driver.find_elements.side_effect = find_elements
-        driver.execute_script.side_effect = lambda script, *args: (
-            row if "closest(" in script else args[0] if args else None
+        driver.execute_script.side_effect = lambda _script, *args: (
+            args[0] if args else None
         )
         with patch("whatsapp._wait_for_search_input", return_value=search_input):
             _open_group(driver, group_name)
 
         driver.execute_script.assert_any_call("arguments[0].focus()", search_input)
         search_input.send_keys.assert_any_call(group_name)
-        row.click.assert_called_once()
+        result.click.assert_called_once()
         self.assertTrue(
             any(
-                "arguments[0].click();" in call.args[0]
-                and call.args[1] is row
+                "arguments[0].click()" in call.args[0]
+                and call.args[1] is result
                 for call in driver.execute_script.call_args_list
             )
         )
-        self.assertIn(
-            "contains(@aria-label,",
+        self.assertEqual(
             driver.find_elements.call_args_list[0].args[1],
+            "[data-testid='cell-frame-container'], [role='listitem'], "
+            "[role='row']",
         )
 
     def test_group_search_accepts_accessible_name_and_header_heading(self):
@@ -982,6 +1085,8 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         result.get_attribute.side_effect = lambda name: (
             group_name if name == "aria-label" else None
         )
+        result.text = ""
+        result.find_elements.return_value = []
         header_heading = Mock()
         header_heading.is_displayed.return_value = True
         header_heading.get_attribute.return_value = None
@@ -989,7 +1094,10 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         driver = Mock()
 
         def find_elements(by, selector):
-            if selector.startswith("//*["):
+            if selector == (
+                "[data-testid='cell-frame-container'], [role='listitem'], "
+                "[role='row']"
+            ):
                 return [result]
             if selector.startswith("header "):
                 return [header_heading]
@@ -1012,6 +1120,7 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         result.is_displayed.return_value = True
         result.get_attribute.return_value = None
         result.text = "Teste Geoex\nVocê: teste de validação\n19:30"
+        result.find_elements.return_value = []
         header = Mock()
         header.is_displayed.return_value = True
         header.get_attribute.return_value = None
@@ -1019,8 +1128,10 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         driver = Mock()
 
         def find_elements(by, selector):
-            if selector.startswith("//*"):
-                self.assertIn("contains(normalize-space(.), 'Teste Geoex')", selector)
+            if selector == (
+                "[data-testid='cell-frame-container'], [role='listitem'], "
+                "[role='row']"
+            ):
                 return [result]
             if selector.startswith("header "):
                 return [header]
@@ -1098,15 +1209,20 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         canvas.get_attribute.return_value = "media-editor-canvas"
         editor_container = Mock()
         editor_container.is_displayed.return_value = True
+        unrelated_dialog = Mock()
+        unrelated_dialog.is_displayed.return_value = True
         driver = Mock()
         driver.find_elements.side_effect = lambda by, selector: (
             [canvas]
             if "media-editor" in selector
+            else [unrelated_dialog]
+            if selector == "//*[@role='dialog']"
             else []
         )
         driver.execute_script.return_value = editor_container
 
         self.assertIs(_media_dialog(driver), editor_container)
+        self.assertIsNot(_media_dialog(driver), unrelated_dialog)
         self.assertEqual(
             driver.execute_script.call_args.args[1],
             canvas,
@@ -1115,6 +1231,20 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             "node.querySelectorAll",
             driver.execute_script.call_args.args[0],
         )
+
+    def test_media_dialog_ignores_unrelated_whatsapp_tooltip(self):
+        unrelated_dialog = Mock()
+        unrelated_dialog.is_displayed.return_value = True
+        unrelated_dialog.find_elements.return_value = []
+        driver = Mock()
+        driver.find_elements.side_effect = lambda _by, selector: (
+            [unrelated_dialog]
+            if selector == "//*[@role='dialog']"
+            else []
+        )
+        driver.execute_script.return_value = False
+
+        self.assertFalse(_media_dialog(driver))
 
     def test_media_send_button_is_recognized_by_nested_send_icon(self):
         send_button = Mock()
@@ -1128,6 +1258,68 @@ class WhatsAppDeliveryTests(unittest.TestCase):
         preview_container.find_elements.return_value = [send_button]
 
         self.assertIs(_send_button(preview_container), send_button)
+
+    def test_media_send_button_is_recognized_by_accessible_label(self):
+        send_button = Mock()
+        send_button.text = ""
+        send_button.get_attribute.side_effect = lambda name: (
+            "Enviar 1 item selecionado"
+            if name == "aria-label"
+            else None
+        )
+        send_button.find_elements.return_value = []
+        send_button.is_displayed.return_value = True
+        media_dialog = Mock()
+        media_dialog.find_elements.return_value = [send_button]
+
+        result = _send_button(media_dialog)
+
+        self.assertIs(result, send_button)
+        self.assertIn(
+            "[aria-label*='Enviar']",
+            media_dialog.find_elements.call_args.args[1],
+        )
+
+    def test_media_caption_lookup_prefers_media_caption_over_conversation_box(self):
+        compose_box = Mock()
+        compose_box.is_displayed.return_value = True
+        compose_box.get_attribute.side_effect = lambda name: (
+            "conversation-compose-box-input"
+            if name == "data-testid"
+            else "Digite uma mensagem para o grupo Teste Geoex"
+            if name == "aria-label"
+            else None
+        )
+        caption_box = Mock()
+        caption_box.is_displayed.return_value = True
+        caption_box.get_attribute.side_effect = lambda name: (
+            "media-caption-input-container"
+            if name == "data-testid"
+            else "Digite uma mensagem"
+            if name == "aria-label"
+            else None
+        )
+        driver = Mock()
+        driver.find_elements.return_value = [compose_box, caption_box]
+
+        result = _media_caption_box(driver)
+
+        self.assertIs(result, caption_box)
+
+    def test_media_caption_lookup_does_not_use_the_conversation_composer(self):
+        compose_box = Mock()
+        compose_box.is_displayed.return_value = True
+        compose_box.get_attribute.side_effect = lambda name: (
+            "conversation-compose-box-input"
+            if name == "data-testid"
+            else "Digite uma mensagem para o grupo Teste Geoex"
+            if name == "aria-label"
+            else None
+        )
+        driver = Mock()
+        driver.find_elements.return_value = [compose_box]
+
+        self.assertFalse(_media_caption_box(driver))
 
     def test_multiple_photos_use_photo_video_menu_and_send_one_caption(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1154,6 +1346,7 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                 patch("whatsapp._click_media_menu_item"),
                 patch("whatsapp._find_file_input", return_value=file_input),
                 patch("whatsapp._conversation_compose_box", return_value=Mock()),
+                patch("whatsapp._media_caption_box", return_value=caption_box),
                 patch(
                     "whatsapp._media_dialog",
                     side_effect=lambda _driver: next(media_dialog_calls),
@@ -1198,6 +1391,51 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                 ]
             ),
             1,
+        )
+
+    def test_single_photo_uses_existing_file_input_without_attachment_menu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "foto.jpg"
+            image.write_bytes(b"original image")
+            driver = Mock()
+            file_input = Mock()
+            file_input.get_property.return_value = False
+            dialog = Mock()
+            dialog.is_displayed.return_value = True
+            send_button = Mock()
+            media_dialog_calls = iter([dialog, dialog, False])
+
+            with (
+                patch("whatsapp._wait_for_conversation_compose_box"),
+                patch("whatsapp._click_attachment_button") as click_attach,
+                patch("whatsapp._click_media_menu_item") as click_media,
+                patch("whatsapp._conversation_compose_box", return_value=Mock()),
+                patch(
+                    "whatsapp._find_file_input",
+                    return_value=file_input,
+                ) as find_input,
+                patch("whatsapp._media_caption_box", return_value=False),
+                patch(
+                    "whatsapp._media_dialog",
+                    side_effect=lambda _driver: next(media_dialog_calls),
+                ),
+                patch("whatsapp._send_button", return_value=send_button),
+                patch(
+                    "whatsapp.WebDriverWait",
+                    return_value=Mock(
+                        until=lambda condition: condition(driver)
+                    ),
+                ),
+            ):
+                _send_images_with_caption(driver, [image], "")
+
+        find_input.assert_called_once_with(driver, images_only=True)
+        click_attach.assert_not_called()
+        click_media.assert_not_called()
+        file_input.send_keys.assert_called_once_with(str(image.resolve()))
+        self.assertIn(
+            unittest.mock.call("arguments[0].click()", send_button),
+            driver.execute_script.call_args_list,
         )
 
     def test_multiple_photos_fail_before_upload_if_input_lacks_multiple(self):
@@ -1253,6 +1491,7 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                 patch("whatsapp._click_media_menu_item"),
                 patch("whatsapp._find_file_input", return_value=file_input),
                 patch("whatsapp._media_dialog", return_value=media_editor),
+                patch("whatsapp._media_caption_box", return_value=False),
                 patch("whatsapp._media_preview_diagnostics", return_value="{}"),
                 patch("whatsapp.WebDriverWait", ImmediateWait),
             ):
@@ -1311,6 +1550,13 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                 patch("whatsapp._send_media") as send_media,
                 patch("whatsapp._send_document") as send_document,
             ):
+                process_events = []
+                send_document.side_effect = lambda *_args: process_events.append(
+                    "zip_confirmed"
+                )
+                driver.quit.side_effect = lambda: process_events.append(
+                    "browser_closed"
+                )
                 confirmation_prompts = []
                 enviar_respostas(
                     output_dir,
@@ -1336,6 +1582,10 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             self.assertIn("Motivo do impedimento: Conta paga", media_args[2])
             send_document.assert_called_once_with(driver, root / "Respostas.zip")
             driver.quit.assert_called_once()
+            self.assertEqual(
+                process_events,
+                ["zip_confirmed", "browser_closed"],
+            )
             with zipfile.ZipFile(root / "Respostas.zip") as archive:
                 self.assertIn("123/123_foto.jpg", archive.namelist())
                 self.assertIn("456/descricao.txt", archive.namelist())

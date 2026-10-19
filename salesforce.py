@@ -903,6 +903,7 @@ def consultar_notas(
     output_dir: Path,
     profile_dir: Path | None,
     on_result: Callable[[ResultadoNota], None] | None = None,
+    output_fn: Callable[[str], None] = print,
 ) -> list[ResultadoNota]:
     driver = criar_navegador(output_dir, profile_dir)
     results: list[ResultadoNota] = []
@@ -915,7 +916,7 @@ def consultar_notas(
             results.append(result)
             if on_result is not None:
                 on_result(result)
-            print(
+            output_fn(
                 f"Nota {note}: {result.status}"
                 + (f" ({result.erro})" if result.erro else "")
             )

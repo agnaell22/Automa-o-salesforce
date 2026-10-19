@@ -5,18 +5,18 @@ import sys
 import tempfile
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 
-DEFAULT_WORKBOOK = Path(r"D:\automação salesforce\Geoex_Metropolitana.xlsx")
-DEFAULT_OUTPUT = Path(r"D:\automação salesforce\Respostas")
+DEFAULT_WORKBOOK = Path(r"C:\automação salesforce\Geoex_Metropolitana.xlsx")
+DEFAULT_OUTPUT = Path(r"C:\automação salesforce\Respostas")
 DEFAULT_SHEET = "Notas sem evidências"
 DEFAULT_COLUMN = "Nota"
 DEFAULT_SALESFORCE_URL = "https://wfmneoenergia.my.salesforce.com/"
-DEFAULT_WHATSAPP_GROUP = "Teste Geoex"
+DEFAULT_WHATSAPP_GROUP = "Pendências Geoex - Metropolitana"
 REPORT_NAME = "relatorio_processamento.csv"
 LEGACY_REPORT_FIELDS = (
     "nota",
@@ -250,6 +250,7 @@ def write_report(
 ) -> None:
     previous_rows = read_existing_report(report_path)
     updates = updates or {}
+    all_notes = list(dict.fromkeys([*previous_rows, *notes, *updates]))
     report_path.parent.mkdir(parents=True, exist_ok=True)
 
     file_descriptor, temporary_name = tempfile.mkstemp(
@@ -268,7 +269,7 @@ def write_report(
                 lineterminator="\n",
             )
             writer.writeheader()
-            for note in notes:
+            for note in all_notes:
                 row = {field: "" for field in REPORT_FIELDS}
                 row.update({"nota": note, "status": "Pendente"})
                 row.update(previous_rows.get(note, {}))
@@ -291,11 +292,7 @@ def prepare_report(
     report_path: Path,
     notes: list[str],
     metadata: dict[str, dict[str, str]],
-    *,
-    read_only: bool = False,
 ) -> dict[str, dict[str, str]]:
-    if read_only and report_path.is_file():
-        return read_existing_report(report_path)
     write_report(report_path, notes, metadata)
     return read_existing_report(report_path)
 
@@ -313,7 +310,7 @@ def select_notes_to_process(
     return [note for note in notes if note not in successful_notes][:limit]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Valida a planilha e prepara uma fila de notas e um relatório "
@@ -367,11 +364,17 @@ def parse_args() -> argparse.Namespace:
             "(padrão: %%LOCALAPPDATA%%\\SalesforceAutomation\\WhatsAppProfile)."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(
+    argv: list[str] | None = None,
+    *,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+    error_fn: Callable[[str], None] | None = None,
+) -> int:
+    args = parse_args(argv)
     try:
         notes = load_notes(args.planilha, args.aba, args.coluna)
         metadata = load_note_metadata(
@@ -381,21 +384,31 @@ def main() -> int:
             notes,
         )
         args.saida.mkdir(parents=True, exist_ok=True)
+        report_path = args.saida / REPORT_NAME
+        previous_rows = read_existing_report(report_path)
+        new_notes = [note for note in notes if note not in previous_rows]
+        notes_to_initialize = [
+            note
+            for note in notes
+            if note not in previous_rows
+            or not (args.saida / note / "descricao.txt").is_file()
+        ]
         for note in notes:
             (args.saida / note).mkdir(exist_ok=True)
-        write_note_descriptions(args.saida, notes, metadata)
-        report_path = args.saida / REPORT_NAME
+        metadata_to_initialize = {
+            note: metadata[note] for note in notes_to_initialize
+        }
+        write_note_descriptions(args.saida, notes_to_initialize, metadata)
         existing_rows = prepare_report(
             report_path,
             notes,
-            metadata,
-            read_only=args.enviar_whatsapp and not args.consultar_salesforce,
+            metadata_to_initialize,
         )
         if args.consultar_salesforce:
             if args.limite < 1:
                 raise ValueError("--limite deve ser maior que zero.")
             notes_to_process = select_notes_to_process(
-                notes,
+                [*new_notes, *(note for note in notes if note not in new_notes)],
                 existing_rows,
                 args.limite,
             )
@@ -423,6 +436,7 @@ def main() -> int:
                     args.saida,
                     args.perfil_chrome,
                     on_result=save_result,
+                    output_fn=output_fn,
                 )
             else:
                 resultados = []
@@ -440,22 +454,33 @@ def main() -> int:
                 existing_rows,
                 args.grupo_whatsapp,
                 args.perfil_whatsapp,
+                input_fn=input_fn,
+                output_fn=output_fn,
             )
     except (OSError, InvalidFileException, ValueError) as error:
-        print(f"Erro: {error}", file=sys.stderr)
+        message = f"Erro: {error}"
+        if error_fn is None:
+            print(message, file=sys.stderr)
+        else:
+            error_fn(message)
         return 1
     except RuntimeError as error:
-        print(f"Erro: {error}", file=sys.stderr)
+        message = f"Erro: {error}"
+        if error_fn is None:
+            print(message, file=sys.stderr)
+        else:
+            error_fn(message)
         return 1
 
-    print(f"Notas preparadas: {len(notes)}")
-    print(f"Relatório: {report_path}")
-    print(f"Pastas por nota: {args.saida}")
+    output_fn(f"Notas preparadas: {len(notes)}")
+    output_fn(f"Novas notas adicionadas ao relatório: {len(new_notes)}")
+    output_fn(f"Relatório: {report_path}")
+    output_fn(f"Pastas por nota: {args.saida}")
     if args.consultar_salesforce:
-        print(f"Notas consultadas no Salesforce: {len(resultados)}")
-        print(f"Notas já concluídas ignoradas: {skipped_success_count}")
+        output_fn(f"Notas consultadas no Salesforce: {len(resultados)}")
+        output_fn(f"Notas já concluídas ignoradas: {skipped_success_count}")
     else:
-        print("Nenhuma consulta ou alteração foi feita no Salesforce.")
+        output_fn("Nenhuma consulta ou alteração foi feita no Salesforce.")
     return 0
 
 
