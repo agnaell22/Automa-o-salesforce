@@ -56,9 +56,11 @@ from whatsapp import (
     _document_message_states,
     _media_caption_box,
     _media_dialog,
+    _media_message_states,
     _normalized_group_text,
     _open_group,
     _wait_for_document_sent,
+    _wait_for_media_sent,
     _send_button,
     _send_media,
     _send_images_with_caption,
@@ -256,7 +258,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(args.grupo_whatsapp, DEFAULT_WHATSAPP_GROUP)
         self.assertEqual(
             DEFAULT_WHATSAPP_GROUP,
-            "Pendências Geoex - Metropolitana",
+            "Teste Geoex",
         )
         self.assertEqual(args.limite, 100)
 
@@ -1358,6 +1360,8 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                         until=lambda condition: condition(driver)
                     ),
                 ),
+                patch("whatsapp._media_message_states", return_value=[]),
+                patch("whatsapp._wait_for_media_sent") as wait_for_sent,
             ):
                 _send_images_with_caption(
                     driver, images, "Primeira linha\nSegunda linha"
@@ -1392,16 +1396,21 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             ),
             1,
         )
+        wait_for_sent.assert_called_once_with(
+            driver, "Primeira linha\nSegunda linha", set()
+        )
 
-    def test_single_photo_uses_existing_file_input_without_attachment_menu(self):
+    def test_single_photo_uses_photo_video_menu_and_sends_caption(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "foto.jpg"
             image.write_bytes(b"original image")
             driver = Mock()
             file_input = Mock()
-            file_input.get_property.return_value = False
+            file_input.get_property.return_value = True
             dialog = Mock()
             dialog.is_displayed.return_value = True
+            caption_box = Mock()
+            caption_box.is_displayed.return_value = True
             send_button = Mock()
             media_dialog_calls = iter([dialog, dialog, False])
 
@@ -1414,7 +1423,7 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                     "whatsapp._find_file_input",
                     return_value=file_input,
                 ) as find_input,
-                patch("whatsapp._media_caption_box", return_value=False),
+                patch("whatsapp._media_caption_box", return_value=caption_box),
                 patch(
                     "whatsapp._media_dialog",
                     side_effect=lambda _driver: next(media_dialog_calls),
@@ -1426,17 +1435,48 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                         until=lambda condition: condition(driver)
                     ),
                 ),
+                patch("whatsapp._media_message_states", return_value=[]),
+                patch("whatsapp._wait_for_media_sent") as wait_for_sent,
             ):
-                _send_images_with_caption(driver, [image], "")
+                _send_images_with_caption(driver, [image], "Nota 123")
 
+        click_attach.assert_called_once_with(driver)
+        click_media.assert_called_once_with(driver)
         find_input.assert_called_once_with(driver, images_only=True)
-        click_attach.assert_not_called()
-        click_media.assert_not_called()
         file_input.send_keys.assert_called_once_with(str(image.resolve()))
+        caption_box.send_keys.assert_called_once_with("Nota 123")
         self.assertIn(
             unittest.mock.call("arguments[0].click()", send_button),
             driver.execute_script.call_args_list,
         )
+        wait_for_sent.assert_called_once_with(driver, "Nota 123", set())
+
+    def test_wait_for_media_sent_requires_a_new_confirmed_caption_message(self):
+        driver = Mock()
+        message = {
+            "id": "new-message",
+            "text": "Nota: 123\nDescrição da nota",
+            "hasMedia": True,
+            "sent": True,
+        }
+
+        timeouts = []
+
+        class ImmediateWait:
+            def __init__(self, _driver, timeout):
+                timeouts.append(timeout)
+
+            def until(self, condition):
+                return condition(driver)
+
+        with (
+            patch("whatsapp._media_dialog", return_value=False),
+            patch("whatsapp._media_message_states", return_value=[message]),
+            patch("whatsapp.WebDriverWait", ImmediateWait),
+        ):
+            _wait_for_media_sent(driver, "Nota: 123\nDescrição da nota", set())
+
+        self.assertEqual(timeouts, [300])
 
     def test_multiple_photos_fail_before_upload_if_input_lacks_multiple(self):
         with tempfile.TemporaryDirectory() as directory:

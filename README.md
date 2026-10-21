@@ -136,7 +136,7 @@ python automacao.py --enviar-whatsapp
 O Chrome usa um perfil separado em
 `%LOCALAPPDATA%\SalesforceAutomation\WhatsAppProfile`. Na primeira execução,
 leia manualmente o QR Code do WhatsApp Web. O programa procura o grupo pelo
-nome exato informado (padrão: `Pendências Geoex - Metropolitana`) e pede confirmação no terminal
+nome exato informado (padrão: `Teste Geoex`) e pede confirmação no terminal
 uma vez antes de iniciar os envios. Após a confirmação, as notas e o ZIP são
 enviados automaticamente, sem confirmações individuais. Só são publicadas
 notas com status `Concluída` e imagens; notas sem imagens, pendentes ou com
@@ -146,7 +146,8 @@ menu de anexos; várias imagens são anexadas juntas pelo menu `Fotos e vídeos`
 como fotos originais. A descrição combinada com o motivo de impedimento, quando
 preenchido, é enviada como legenda na mesma mensagem. Se o WhatsApp não aceitar
 o lote de imagens ou não oferecer o campo de legenda, o envio da nota é
-interrompido; a descrição não é enviada separadamente.
+interrompido; a descrição não é enviada separadamente. O campo de legenda pode
+levar até 30 segundos para aparecer.
 
 Também é possível consultar o Salesforce e enviar no mesmo comando:
 
@@ -164,7 +165,11 @@ quando uma nova mensagem com o nome do arquivo aparece no grupo e tem um
 indicador acessível de envio concluído. A automação aguarda até cinco minutos;
 se não conseguir confirmar, informa as mensagens observadas, não marca o ZIP
 como enviado e encerra o navegador. Estados antigos sem essa confirmação serão
-tratados como não verificados e o ZIP será enviado novamente uma vez.
+tratados como não verificados e o ZIP será enviado novamente uma vez. As notas
+também aguardam até cinco minutos por um novo balão com imagem, legenda e
+confirmação de envio antes de serem marcadas como enviadas; esse intervalo
+impede que o envio da próxima nota comece enquanto a anterior ainda está sendo
+processada.
 Após confirmar o envio do ZIP e salvar o estado, o navegador é encerrado
 automaticamente e o comando termina.
 

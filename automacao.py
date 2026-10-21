@@ -11,12 +11,12 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 
-DEFAULT_WORKBOOK = Path(r"C:\automação salesforce\Geoex_Metropolitana.xlsx")
-DEFAULT_OUTPUT = Path(r"C:\automação salesforce\Respostas")
+DEFAULT_WORKBOOK = Path(r"D:\automação salesforce\Geoex_Metropolitana.xlsx")
+DEFAULT_OUTPUT = Path(r"D:\automação salesforce\Respostas")
 DEFAULT_SHEET = "Notas sem evidências"
 DEFAULT_COLUMN = "Nota"
 DEFAULT_SALESFORCE_URL = "https://wfmneoenergia.my.salesforce.com/"
-DEFAULT_WHATSAPP_GROUP = "Pendências Geoex - Metropolitana"
+DEFAULT_WHATSAPP_GROUP = "Teste Geoex"
 REPORT_NAME = "relatorio_processamento.csv"
 LEGACY_REPORT_FIELDS = (
     "nota",

@@ -25,7 +25,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 LOGIN_TIMEOUT_SECONDS = 300
 PAGE_TIMEOUT_SECONDS = 30
 DOCUMENT_SEND_TIMEOUT_SECONDS = 300
-CAPTION_FIELD_TIMEOUT_SECONDS = 10
+MEDIA_SEND_TIMEOUT_SECONDS = 300
+CAPTION_FIELD_TIMEOUT_SECONDS = PAGE_TIMEOUT_SECONDS
 MEDIA_MENU_TIMEOUT_SECONDS = 10
 SUCCESSFUL_SALESFORCE_STATUSES = frozenset({"Concluída"})
 WHATSAPP_STATE_VERSION = 2
@@ -310,17 +311,26 @@ def _open_group(driver: webdriver.Chrome, group_name: str) -> None:
         ) from error
 
     def matching_header(browser: webdriver.Chrome) -> bool:
+        compose_box = _conversation_compose_box(browser)
+        if compose_box:
+            compose_aria = (compose_box.get_attribute("aria-label") or "").casefold()
+            if group_name.casefold() in compose_aria:
+                return True
+        expected_name = _normalized_group_text(group_name)
         for element in browser.find_elements(
             By.CSS_SELECTOR,
             "header [title], header [aria-label], header h1, header h2, "
             "header span, [data-testid='conversation-info-header'] "
             "[title], [data-testid='conversation-info-header'] "
-            "[aria-label], [data-testid='conversation-info-header'] span",
+            "[aria-label], [data-testid='conversation-info-header'] span, "
+            "#main header [title], #main header [aria-label], #main header h1, #main header h2, "
+            "#main header span",
         ):
             if not _visible(element):
                 continue
             if any(
                 element.get_attribute(attribute) == group_name
+                or _normalized_group_text(element.get_attribute(attribute) or "") == expected_name
                 for attribute in ("title", "aria-label")
             ):
                 return True
@@ -329,7 +339,9 @@ def _open_group(driver: webdriver.Chrome, group_name: str) -> None:
                 for line in (element.text or "").splitlines()
                 if line.strip()
             }
-            if group_name in text_lines:
+            if group_name in text_lines or any(
+                _normalized_group_text(line) == expected_name for line in text_lines
+            ):
                 return True
         return False
 
@@ -401,18 +413,23 @@ def _find_file_input(
     *,
     images_only: bool,
 ) -> WebElement | bool:
-    candidates: list[tuple[WebElement, str]] = []
+    candidates: list[tuple[WebElement, str, bool]] = []
     for element in driver.find_elements(By.CSS_SELECTOR, "input[type='file']"):
         accept = (element.get_attribute("accept") or "").casefold()
+        multiple = bool(element.get_property("multiple"))
         is_image_input = "image" in accept or any(
             extension in accept for extension in IMAGE_EXTENSIONS
         )
         if is_image_input == images_only:
-            candidates.append((element, accept))
+            candidates.append((element, accept, multiple))
     if images_only:
-        for element, accept in candidates:
+        for element, accept, _multiple in candidates:
             if "video/" in accept:
                 return element
+        for element, _accept, multiple in candidates:
+            if multiple:
+                return element
+        return False
     if candidates:
         return candidates[0][0]
     return False
@@ -558,7 +575,9 @@ def _media_caption_box(driver: webdriver.Chrome) -> WebElement | bool:
     candidates = driver.find_elements(
         By.CSS_SELECTOR,
         "[data-testid='media-caption-input-container'], "
-        "[contenteditable='true'], textarea, [data-placeholder]",
+        "[data-testid='media-caption-input-container'] [contenteditable='true'], "
+        "[data-testid='media-caption-input-container'] [role='textbox'], "
+        "[contenteditable='true'], textarea, [role='textbox'], [data-placeholder]",
     )
     ranked_candidates: list[tuple[int, WebElement]] = []
     for element in candidates:
@@ -583,6 +602,11 @@ def _media_caption_box(driver: webdriver.Chrome) -> WebElement | bool:
             for word in ("caption", "legenda")
         ):
             rank = 2
+        elif element.find_elements(
+            By.XPATH,
+            "ancestor-or-self::*[@data-testid='media-caption-input-container']",
+        ):
+            rank = 3
         else:
             continue
         ranked_candidates.append((rank, element))
@@ -889,20 +913,14 @@ def _send_images_with_caption(
     selected_input = ""
     try:
         _wait_for_conversation_compose_box(driver)
-        file_input = (
-            _find_file_input(driver, images_only=True)
-            if len(images) == 1
-            else False
-        )
-        if not file_input:
-            _click_attachment_button(driver)
-            stage = "selecionar Fotos e vídeos"
-            _click_media_menu_item(driver)
+        _click_attachment_button(driver)
+        stage = "selecionar Fotos e vídeos"
+        _click_media_menu_item(driver)
 
-            stage = "localizar o seletor de fotos"
-            file_input = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-                lambda browser: _find_file_input(browser, images_only=True)
-            )
+        stage = "localizar o seletor de fotos"
+        file_input = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
+            lambda browser: _find_file_input(browser, images_only=True)
+        )
         supports_multiple = bool(file_input.get_property("multiple"))
         if len(images) > 1 and not supports_multiple:
             raise RuntimeError(
@@ -953,6 +971,11 @@ def _send_images_with_caption(
                 if line:
                     caption_box.send_keys(line)
 
+        previous_message_ids = {
+            message["id"]
+            for message in _media_message_states(driver)
+            if message["id"]
+        }
         stage = "localizar o botão Enviar"
         send_button = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
             lambda browser: (
@@ -966,13 +989,7 @@ def _send_images_with_caption(
         stage = "clicar no botão Enviar"
         driver.execute_script("arguments[0].click()", send_button)
         stage = "confirmar o envio das imagens"
-        WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-            lambda browser: (
-                _conversation_compose_box(browser)
-                if not _media_dialog(browser)
-                else False
-            )
-        )
+        _wait_for_media_sent(driver, caption, previous_message_ids)
     except TimeoutException as error:
         details = (
             f" Seletor de arquivo usado: {selected_input}. "
@@ -1053,6 +1070,138 @@ def _send_document(driver: webdriver.Chrome, archive_path: Path) -> None:
         ) from error
 
 
+def _media_message_states(
+    driver: webdriver.Chrome,
+) -> list[dict[str, str | bool]]:
+    messages = driver.execute_script(
+        """
+        const visible = (element) =>
+            element.getClientRects().length > 0 &&
+            getComputedStyle(element).visibility !== 'hidden';
+        return [...document.querySelectorAll('[data-testid="msg-container"]')]
+            .filter(visible)
+            .map((message, index) => {
+                const row = message.closest('[role="row"]') || message.parentElement;
+                let id = message.getAttribute('data-id') ||
+                         message.closest('[data-id]')?.getAttribute('data-id') ||
+                         message.querySelector('[data-id]')?.getAttribute('data-id') || '';
+                if (!id && row) {
+                    for (const el of [row, ...row.querySelectorAll('*')]) {
+                        const testId = el.getAttribute('data-testid') || '';
+                        if (testId.startsWith('conv-msg-')) {
+                            id = testId.replace('conv-msg-', '');
+                            break;
+                        }
+                        if (el.getAttribute('data-id')) {
+                            id = el.getAttribute('data-id');
+                            break;
+                        }
+                    }
+                }
+                if (!id) {
+                    const textSnippet = (message.innerText || '').slice(0, 40).replace(/\\s+/g, '_');
+                    id = 'msg_' + index + '_' + textSnippet;
+                }
+                const statusLabels = [
+                    ...message.querySelectorAll(
+                        '[data-icon], [data-testid], [aria-label], [title]'
+                    )
+                ].map((element) => [
+                    element.getAttribute('data-icon'),
+                    element.getAttribute('data-testid'),
+                    element.getAttribute('aria-label'),
+                    element.getAttribute('title'),
+                    element.className
+                ].filter(Boolean).join(' ').toLowerCase());
+                return {
+                    id: id,
+                    text: [
+                        message.innerText,
+                        message.textContent
+                    ].filter(Boolean).join(' '),
+                    hasMedia: Boolean(message.querySelector('img, video, [data-testid="image-thumb"], [data-testid="media-url-provider"]')),
+                    sent: statusLabels.some((label) =>
+                        /msg-(?:dbl)?check(?:\\b|-)|msg-ack|double\\s*check|single\\s*check|enviad[oa]s?|entregue|read|lido[as]?|wds-ic-read/.test(label))
+                };
+            });
+        """
+    )
+    if not isinstance(messages, list) or any(
+        not isinstance(message, dict)
+        or not isinstance(message.get("id"), str)
+        or not isinstance(message.get("text"), str)
+        or not isinstance(message.get("hasMedia"), bool)
+        or not isinstance(message.get("sent"), bool)
+        for message in messages
+    ):
+        raise RuntimeError(
+            "O WhatsApp Web retornou um estado inválido para a confirmação "
+            "do envio das imagens."
+        )
+    return messages
+
+
+def _wait_for_media_sent(
+    driver: webdriver.Chrome,
+    caption: str,
+    previous_message_ids: set[str],
+) -> None:
+    normalized_caption = " ".join(caption.split()).casefold()
+    first_line = caption.splitlines()[0].strip().casefold() if caption else ""
+
+    def is_media_sent(browser: webdriver.Chrome) -> bool:
+        if _media_dialog(browser):
+            return False
+        current_messages = _media_message_states(browser)
+        if not current_messages:
+            return False
+
+        def matches_caption(text: str) -> bool:
+            if not normalized_caption:
+                return True
+            norm = " ".join(text.split()).casefold()
+            return normalized_caption in norm or (first_line and first_line in norm)
+
+        # 1. Nova mensagem com id não visto anteriormente
+        for message in current_messages:
+            if (
+                message["id"]
+                and message["id"] not in previous_message_ids
+                and message["hasMedia"]
+                and message["sent"]
+                and matches_caption(message["text"])
+            ):
+                return True
+
+        # 2. A última mensagem enviada no chat tem a mídia, status enviado e a legenda
+        last = current_messages[-1]
+        if last["hasMedia"] and last["sent"] and matches_caption(last["text"]):
+            return True
+
+        return False
+
+    try:
+        WebDriverWait(driver, MEDIA_SEND_TIMEOUT_SECONDS).until(is_media_sent)
+    except TimeoutException as error:
+        messages = _media_message_states(driver)
+        new_messages = [
+            {
+                "id": message["id"],
+                "hasMedia": message["hasMedia"],
+                "sent": message["sent"],
+                "text": message["text"][:160],
+            }
+            for message in messages
+            if message["id"] and message["id"] not in previous_message_ids
+        ]
+        raise RuntimeError(
+            "O WhatsApp Web não confirmou o envio da imagem em "
+            f"{MEDIA_SEND_TIMEOUT_SECONDS} segundos. A nota não foi marcada "
+            "como enviada; verifique o grupo antes de tentar novamente. "
+            f"Mensagens novas observadas: {new_messages}"
+        ) from error
+
+
 def _document_message_states(
     driver: webdriver.Chrome,
     archive_name: str,
@@ -1065,7 +1214,27 @@ def _document_message_states(
         const archiveName = arguments[0].toLocaleLowerCase();
         return [...document.querySelectorAll('[data-testid="msg-container"]')]
             .filter(visible)
-            .map((message) => {
+            .map((message, index) => {
+                const row = message.closest('[role="row"]') || message.parentElement;
+                let id = message.getAttribute('data-id') ||
+                         message.closest('[data-id]')?.getAttribute('data-id') ||
+                         message.querySelector('[data-id]')?.getAttribute('data-id') || '';
+                if (!id && row) {
+                    for (const el of [row, ...row.querySelectorAll('*')]) {
+                        const testId = el.getAttribute('data-testid') || '';
+                        if (testId.startsWith('conv-msg-')) {
+                            id = testId.replace('conv-msg-', '');
+                            break;
+                        }
+                        if (el.getAttribute('data-id')) {
+                            id = el.getAttribute('data-id');
+                            break;
+                        }
+                    }
+                }
+                if (!id) {
+                    id = 'doc_msg_' + index;
+                }
                 const statusLabels = [
                     ...message.querySelectorAll(
                         '[data-icon], [data-testid], [aria-label], [title]'
@@ -1090,11 +1259,10 @@ def _document_message_states(
                     ])
                 ].filter(Boolean).join(' ').toLocaleLowerCase();
                 return {
-                    id: message.getAttribute('data-id') ||
-                        message.querySelector('[data-id]')?.getAttribute('data-id') || '',
+                    id: id,
                     hasDocument: messageText.includes(archiveName),
                     sent: statusLabels.some((label) =>
-                        /msg-(?:dbl)?check(?:\\b|-)|msg-ack|double\\s*check|single\\s*check|enviad[oa]s?|entregue|read|lido[as]?/.test(label))
+                        /msg-(?:dbl)?check(?:\\b|-)|msg-ack|double\\s*check|single\\s*check|enviad[oa]s?|entregue|read|lido[as]?|wds-ic-read/.test(label))
                 };
             });
         """,
@@ -1122,13 +1290,21 @@ def _wait_for_document_sent(
     def is_document_sent(browser: webdriver.Chrome) -> bool:
         if _media_dialog(browser):
             return False
-        return any(
-            message["id"] not in previous_message_ids
-            and message["hasDocument"]
-            and message["sent"]
-            for message in _document_message_states(browser, archive_path.name)
-            if message["id"]
-        )
+        current_messages = _document_message_states(browser, archive_path.name)
+        if not current_messages:
+            return False
+        for message in current_messages:
+            if (
+                message["id"]
+                and message["id"] not in previous_message_ids
+                and message["hasDocument"]
+                and message["sent"]
+            ):
+                return True
+        last = current_messages[-1]
+        if last["hasDocument"] and last["sent"]:
+            return True
+        return False
 
     try:
         WebDriverWait(driver, DOCUMENT_SEND_TIMEOUT_SECONDS).until(
