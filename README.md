@@ -59,13 +59,21 @@ após mudanças no código, execute `.\build_windows.ps1` novamente.
 
 O programa cria uma pasta por nota com `descricao.txt` contendo Texto code
 ação, Código de ação, Data encermto. e CenTrab respon. Também registra esses
-campos, a coluna `UTD` da planilha, o status, o motivo, os arquivos baixados e
-erros em `relatorio_processamento.csv`, que abre no Excel. Notas repetidas são
+campos, a coluna `UTD` da planilha, o `Status usuário`, o status de processamento,
+o `status_wfm` extraído do campo `Status` do Compromisso de Serviço e a
+comparação dos dois status em `relatorio_processamento.csv`, que abre no Excel.
+Sempre que a planilha mudar, os metadados e o `descricao.txt` são sincronizados
+automaticamente para todas as notas existentes. O status WFM consultado no
+Salesforce também é acrescentado à legenda publicada no WhatsApp.
+Na comparação atual, `VRNE` confere com status WFM `Incompleto`; outros valores
+são considerados iguais somente quando a escrita é equivalente. O relatório
+mostra `Confere`, `Nao confere` ou `Nao identificado`. Notas repetidas são
 processadas uma única vez. A cada execução, as notas da planilha são comparadas
 com o relatório: notas que ainda não existem são acrescentadas com status
 `Pendente`, e todas as linhas e resultados anteriores são preservados mesmo se
 uma nota deixar de constar na planilha. Descrições já existentes não são
-sobrescritas durante a sincronização. Mantenha esse CSV fechado no Excel durante
+sobrescritas manualmente, mas os dados da planilha são sincronizados a cada
+execução. Mantenha esse CSV fechado no Excel durante
 consultas ao Salesforce, pois os resultados são gravados progressivamente.
 
 ## Consultar uma nota no Salesforce
@@ -142,12 +150,16 @@ enviados automaticamente, sem confirmações individuais. Só são publicadas
 notas com status `Concluída` e imagens; notas sem imagens, pendentes ou com
 erro não são publicadas individualmente. Uma imagem é anexada pelo seletor de
 arquivo de fotos já disponível na conversa, evitando depender da abertura do
-menu de anexos; várias imagens são anexadas juntas pelo menu `Fotos e vídeos`
-como fotos originais. A descrição combinada com o motivo de impedimento, quando
-preenchido, é enviada como legenda na mesma mensagem. Se o WhatsApp não aceitar
-o lote de imagens ou não oferecer o campo de legenda, o envio da nota é
-interrompido; a descrição não é enviada separadamente. O campo de legenda pode
-levar até 30 segundos para aparecer.
+menu de anexos; no máximo duas imagens são anexadas juntas pelo menu
+`Fotos e vídeos` como fotos originais. Se a pasta da nota tiver mais imagens,
+todas continuam incluídas no ZIP enviado ao final. A descrição combinada com
+o motivo de impedimento, quando preenchido, é enviada como legenda na mesma
+mensagem. Se o WhatsApp não aceitar o lote de imagens ou não oferecer o campo
+de legenda, o envio da nota é interrompido; a descrição não é enviada
+separadamente. Se uma tentativa não puder ser confirmada, a próxima execução
+pede que você verifique o grupo e confirme que a mensagem não foi enviada
+antes de tentar novamente, evitando duplicatas. O campo de legenda pode levar
+até 30 segundos para aparecer.
 
 Também é possível consultar o Salesforce e enviar no mesmo comando:
 

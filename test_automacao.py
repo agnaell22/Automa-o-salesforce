@@ -21,6 +21,7 @@ from automacao import (
     DEFAULT_WHATSAPP_GROUP,
     LEGACY_REPORT_FIELDS,
     REPORT_FIELDS,
+    comparar_status,
     load_note_metadata,
     load_notes,
     normalize_note,
@@ -47,6 +48,8 @@ from salesforce import (
     _buscar_ordem,
     consultar_notas,
     criar_navegador,
+    _ler_status_wfm,
+    _ler_valor_campo,
 )
 from whatsapp import (
     _note_message,
@@ -186,6 +189,7 @@ class WorkbookTests(unittest.TestCase):
                     "CenTrab respon.",
                     "Texto code ação",
                     "UTD",
+                    "Status usuário",
                 ]
             )
             sheet.append(
@@ -197,6 +201,7 @@ class WorkbookTests(unittest.TestCase):
                     "4DW501",
                     "Não Localizado",
                     "UTD-01",
+                    "VRNE",
                 ]
             )
             workbook.save(path)
@@ -219,8 +224,34 @@ class WorkbookTests(unittest.TestCase):
                 "Texto code ação: Não Localizado\n"
                 "Código de ação: NE21\n"
                 "Data de encerramento: 28/09/2026\n"
-                "Centro de trabalho responsável: 4DW501\n",
+                "Centro de trabalho responsável: 4DW501\n"
+                "UTD: UTD-01\n"
+                "Status usuário: VRNE\n",
             )
+
+    def test_updates_existing_description_from_current_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "Respostas"
+            (output / "123").mkdir(parents=True)
+            description_path = output / "123" / "descricao.txt"
+            description_path.write_text("Nota: 123\nUTD: antiga\n", encoding="utf-8")
+            metadata = {
+                "123": {
+                    "texto_code_acao": "Localizado",
+                    "codigo_acao": "NE22",
+                    "data_encerramento": "29/09/2026",
+                    "centro_trabalho": "4DW502",
+                    "UTD": "nova",
+                    "status_usuario": "Concluído",
+                }
+            }
+
+            write_note_descriptions(output, ["123"], metadata)
+
+            content = description_path.read_text(encoding="utf-8")
+            self.assertIn("Texto code ação: Localizado\n", content)
+            self.assertIn("UTD: nova\n", content)
+            self.assertNotIn("UTD: antiga", content)
 
     def test_rejects_conflicting_duplicate_description_columns(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -237,13 +268,49 @@ class WorkbookTests(unittest.TestCase):
                     "CenTrab respon.",
                     "Texto code ação",
                     "UTD",
+                    "Status usuário",
                 ]
             )
-            sheet.append([123, "A", "NE01", None, "4DW501", "B", "UTD-01"])
+            sheet.append(
+                [123, "A", "NE01", None, "4DW501", "B", "UTD-01", "VRNE"]
+            )
             workbook.save(path)
 
             with self.assertRaisesRegex(ValueError, "duplicadas"):
                 load_note_metadata(path, "Notas sem evidências", "Nota", ["123"])
+
+
+class StatusComparisonTests(unittest.TestCase):
+    def test_vrne_matches_incomplete_wfm_status(self):
+        self.assertEqual(comparar_status("VRNE", "Incompleto"), "Confere")
+
+    def test_vrne_does_not_match_completed_wfm_status(self):
+        self.assertEqual(comparar_status("VRNE", "Concluído"), "Nao confere")
+
+    def test_equal_statuses_match_and_missing_values_are_identified(self):
+        self.assertEqual(comparar_status("Cancelado", "Cancelado"), "Confere")
+        self.assertEqual(comparar_status("VRNE", ""), "Nao identificado")
+
+    def test_reads_status_field_from_wfm_record(self):
+        with patch(
+            "salesforce._ler_valor_campo",
+            side_effect=["Em andamento", "", ""],
+        ):
+            status = _ler_status_wfm(Mock())
+
+        self.assertEqual(status, "Em andamento")
+
+    def test_reads_status_from_header_when_it_is_not_a_list_item(self):
+        parent = Mock()
+        parent.text = "Status\nConcluído"
+        label = Mock()
+        label.find_element.return_value = parent
+        driver = Mock()
+        driver.find_elements.side_effect = [[], [label]]
+
+        status = _ler_valor_campo(driver, "Status")
+
+        self.assertEqual(status, "Concluído")
 
 
 class ReportTests(unittest.TestCase):
@@ -258,7 +325,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(args.grupo_whatsapp, DEFAULT_WHATSAPP_GROUP)
         self.assertEqual(
             DEFAULT_WHATSAPP_GROUP,
-            "Teste Geoex",
+            "Pendências Geoex - Metropolitana",
         )
         self.assertEqual(args.limite, 100)
 
@@ -1008,12 +1075,16 @@ class WhatsAppDeliveryTests(unittest.TestCase):
 
             message = _note_message(
                 description,
-                {"motivo_nao_conclusao": "Conta paga"},
+                {
+                    "status_wfm": "Incompleto",
+                    "motivo_nao_conclusao": "Conta paga",
+                },
             )
 
         self.assertEqual(
             message,
-            "Nota: 123\nCódigo de ação: NE08\nMotivo do impedimento: Conta paga",
+            "Nota: 123\nCódigo de ação: NE08\n"
+            "Status WFM: Incompleto\nMotivo do impedimento: Conta paga",
         )
 
     def test_group_name_is_escaped_as_an_xpath_literal(self):
@@ -1645,6 +1716,129 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                 )
 
             create_browser.assert_not_called()
+
+    def test_sends_at_most_two_images_per_note_but_keeps_all_in_zip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "Respostas"
+            note_dir = output_dir / "123"
+            note_dir.mkdir(parents=True)
+            (output_dir / "relatorio_processamento.csv").write_text(
+                "nota;status\n123;Concluída\n",
+                encoding="utf-8",
+            )
+            (note_dir / "descricao.txt").write_text(
+                "Nota: 123\n",
+                encoding="utf-8",
+            )
+            images = [
+                note_dir / f"123_foto-{index}.jpg"
+                for index in range(1, 4)
+            ]
+            for image in images:
+                image.write_bytes(image.name.encode())
+
+            driver = Mock()
+            with (
+                patch("whatsapp._create_browser", return_value=driver),
+                patch("whatsapp._wait_for_search_input"),
+                patch("whatsapp._open_group"),
+                patch("whatsapp._send_media") as send_media,
+                patch("whatsapp._send_document"),
+            ):
+                enviar_respostas(
+                    output_dir,
+                    {
+                        "123": {
+                            "status": "Concluída",
+                            "motivo_nao_conclusao": "",
+                        }
+                    },
+                    DEFAULT_WHATSAPP_GROUP,
+                    input_fn=lambda _prompt: "s",
+                )
+
+            self.assertEqual(send_media.call_count, 1)
+            self.assertEqual(send_media.call_args.args[1], images[:2])
+            with zipfile.ZipFile(root / "Respostas.zip") as archive:
+                self.assertEqual(
+                    {
+                        name
+                        for name in archive.namelist()
+                        if name.startswith("123/") and name.endswith(".jpg")
+                    },
+                    {f"123/{image.name}" for image in images},
+                )
+
+    def test_unconfirmed_note_requires_user_check_before_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "Respostas"
+            note_dir = output_dir / "123"
+            note_dir.mkdir(parents=True)
+            (output_dir / "relatorio_processamento.csv").write_text(
+                "nota;status\n123;Concluída\n",
+                encoding="utf-8",
+            )
+            (note_dir / "descricao.txt").write_text(
+                "Nota: 123\n",
+                encoding="utf-8",
+            )
+            (note_dir / "123_foto.jpg").write_bytes(b"image")
+
+            with (
+                patch("whatsapp._create_browser", return_value=Mock()),
+                patch("whatsapp._wait_for_search_input"),
+                patch("whatsapp._open_group"),
+                patch(
+                    "whatsapp._send_media",
+                    side_effect=RuntimeError("confirmação não recebida"),
+                ),
+                patch("whatsapp._send_document"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "confirmação não recebida"
+                ):
+                    enviar_respostas(
+                        output_dir,
+                        {
+                            "123": {
+                                "status": "Concluída",
+                                "motivo_nao_conclusao": "",
+                            }
+                        },
+                        DEFAULT_WHATSAPP_GROUP,
+                        input_fn=lambda _prompt: "s",
+                    )
+
+            retry_send = Mock()
+            retry_document = Mock()
+            prompts = []
+            with (
+                patch("whatsapp._create_browser", return_value=Mock()),
+                patch("whatsapp._wait_for_search_input"),
+                patch("whatsapp._open_group"),
+                patch("whatsapp._send_media", retry_send),
+                patch("whatsapp._send_document", retry_document),
+            ):
+                enviar_respostas(
+                    output_dir,
+                    {
+                        "123": {
+                            "status": "Concluída",
+                            "motivo_nao_conclusao": "",
+                        }
+                    },
+                    DEFAULT_WHATSAPP_GROUP,
+                    input_fn=lambda prompt: (
+                        prompts.append(prompt) or ("s" if len(prompts) == 1 else "n")
+                    ),
+                )
+
+            self.assertEqual(retry_send.call_count, 0)
+            self.assertEqual(retry_document.call_count, 1)
+            self.assertEqual(len(prompts), 2)
+            self.assertIn("não foi confirmada", prompts[1])
 
     def test_resumes_after_partial_failure_without_duplicating_sent_notes(self):
         with tempfile.TemporaryDirectory() as directory:

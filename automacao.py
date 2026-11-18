@@ -11,9 +11,9 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 
-DEFAULT_WORKBOOK = Path(r"D:\automação salesforce\Geoex_Metropolitana.xlsx")
-DEFAULT_OUTPUT = Path(r"D:\automação salesforce\Respostas")
-DEFAULT_SHEET = "Notas sem evidências"
+DEFAULT_WORKBOOK = Path(r"C:\projetos\automacao-salesforce\Geoex_Metropolitana.xlsx")
+DEFAULT_OUTPUT = Path(r"C:\projetos\automacao-salesforce\Respostas")
+DEFAULT_SHEET = "Notas sem evidência"
 DEFAULT_COLUMN = "Nota"
 DEFAULT_SALESFORCE_URL = "https://wfmneoenergia.my.salesforce.com/"
 DEFAULT_WHATSAPP_GROUP = "Teste Geoex"
@@ -30,12 +30,15 @@ METADATA_FIELDS = (
     "codigo_acao",
     "data_encerramento",
     "centro_trabalho",
+    "UTD",
+    "status_usuario",
 )
 REPORT_FIELDS = (
     "nota",
     *METADATA_FIELDS,
-    "UTD",
     "status",
+    "status_wfm",
+    "comparacao_status",
     "motivo_nao_conclusao",
     "arquivos_baixados",
     "erro",
@@ -47,6 +50,7 @@ SOURCE_METADATA_COLUMNS = {
     "data_encerramento": "Data encermto.",
     "centro_trabalho": "CenTrab respon.",
     "UTD": "UTD",
+    "status_usuario": "Status usuário",
 }
 
 
@@ -127,6 +131,38 @@ def _format_metadata_value(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return value.strftime("%d/%m/%Y")
     return str(value).strip()
+
+
+def normalize_status(value: str) -> str:
+    import unicodedata
+
+    return " ".join(
+        unicodedata.normalize("NFKD", value)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .casefold()
+        .strip()
+        .split()
+    )
+
+
+def comparar_status(status_usuario: str, status_wfm: str) -> str:
+    sheet_status = normalize_status(status_usuario)
+    wfm_status = normalize_status(status_wfm)
+    if not sheet_status or not wfm_status:
+        return "Nao identificado"
+
+    vrne_equivalentes = {
+        "incompleto",
+        "pendente",
+        "nao iniciado",
+        "não iniciado",
+    }
+    if sheet_status == "vrne" and wfm_status in vrne_equivalentes:
+        return "Confere"
+    if sheet_status == wfm_status:
+        return "Confere"
+    return "Nao confere"
 
 
 def load_note_metadata(
@@ -214,6 +250,8 @@ def write_note_descriptions(
         "codigo_acao": "Código de ação",
         "data_encerramento": "Data de encerramento",
         "centro_trabalho": "Centro de trabalho responsável",
+        "UTD": "UTD",
+        "status_usuario": "Status usuário",
     }
     for note in notes:
         description_path = output_dir / note / "descricao.txt"
@@ -387,22 +425,13 @@ def main(
         report_path = args.saida / REPORT_NAME
         previous_rows = read_existing_report(report_path)
         new_notes = [note for note in notes if note not in previous_rows]
-        notes_to_initialize = [
-            note
-            for note in notes
-            if note not in previous_rows
-            or not (args.saida / note / "descricao.txt").is_file()
-        ]
         for note in notes:
             (args.saida / note).mkdir(exist_ok=True)
-        metadata_to_initialize = {
-            note: metadata[note] for note in notes_to_initialize
-        }
-        write_note_descriptions(args.saida, notes_to_initialize, metadata)
+        write_note_descriptions(args.saida, notes, metadata)
         existing_rows = prepare_report(
             report_path,
             notes,
-            metadata_to_initialize,
+            metadata,
         )
         if args.consultar_salesforce:
             if args.limite < 1:
@@ -421,6 +450,11 @@ def main(
                 row.update(
                     {
                         "status": resultado.status,
+                        "status_wfm": resultado.status_wfm,
+                        "comparacao_status": comparar_status(
+                            row.get("status_usuario", ""),
+                            resultado.status_wfm,
+                        ),
                         "motivo_nao_conclusao": resultado.motivo,
                         "arquivos_baixados": ", ".join(resultado.arquivos),
                         "erro": resultado.erro,

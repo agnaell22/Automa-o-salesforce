@@ -30,6 +30,7 @@ CAPTION_FIELD_TIMEOUT_SECONDS = PAGE_TIMEOUT_SECONDS
 MEDIA_MENU_TIMEOUT_SECONDS = 10
 SUCCESSFUL_SALESFORCE_STATUSES = frozenset({"Concluída"})
 WHATSAPP_STATE_VERSION = 2
+MAX_WHATSAPP_IMAGES_PER_NOTE = 2
 IMAGE_EXTENSIONS = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp"}
 )
@@ -81,6 +82,7 @@ def _load_state(state_path: Path) -> dict[str, Any]:
         return {
             "version": WHATSAPP_STATE_VERSION,
             "notes": {},
+            "pending_notes": {},
             "archive_sha256": "",
         }
     try:
@@ -92,6 +94,7 @@ def _load_state(state_path: Path) -> dict[str, Any]:
     if (
         not isinstance(state, dict)
         or not isinstance(state.get("notes"), dict)
+        or not isinstance(state.get("pending_notes", {}), dict)
         or not isinstance(state.get("archive_sha256", ""), str)
     ):
         raise RuntimeError(
@@ -108,6 +111,7 @@ def _load_state(state_path: Path) -> dict[str, Any]:
     if version != WHATSAPP_STATE_VERSION:
         state["archive_sha256"] = ""
         state["version"] = WHATSAPP_STATE_VERSION
+    state.setdefault("pending_notes", {})
     return state
 
 
@@ -140,6 +144,9 @@ def _note_message(description_path: Path, report_row: dict[str, str]) -> str:
     if not description_path.is_file():
         raise FileNotFoundError(f"Descrição da nota não encontrada: {description_path}")
     message = description_path.read_text(encoding="utf-8").strip()
+    wfm_status = (report_row.get("status_wfm") or "").strip()
+    if wfm_status:
+        message = f"{message}\nStatus WFM: {wfm_status}"
     reason = (report_row.get("motivo_nao_conclusao") or "").strip()
     if reason:
         message = f"{message}\nMotivo do impedimento: {reason}"
@@ -1386,8 +1393,18 @@ def enviar_respostas(
             continue
         message = _note_message(note_dir / "descricao.txt", row)
         fingerprint = _note_fingerprint(note, message, images)
-        if sent_notes.get(note) != fingerprint:
-            pending_notes.append((note, message, images, fingerprint))
+        if (
+            sent_notes.get(note) != fingerprint
+            or note in state["pending_notes"]
+        ):
+            pending_notes.append(
+                (
+                    note,
+                    message,
+                    images[:MAX_WHATSAPP_IMAGES_PER_NOTE],
+                    fingerprint,
+                )
+            )
 
     archive_pending = state.get("archive_sha256") != archive_hash
     if not pending_notes and not archive_pending:
@@ -1409,8 +1426,26 @@ def enviar_respostas(
             return
 
         for note, message, images, fingerprint in pending_notes:
+            if note in state["pending_notes"]:
+                if not _confirm(
+                    f"A tentativa anterior para a nota {note} não foi "
+                    "confirmada. Verifique o grupo no WhatsApp e confirme "
+                    "que a mensagem NÃO foi enviada para autorizar uma nova "
+                    "tentativa",
+                    input_fn,
+                ):
+                    output_fn(
+                        f"WhatsApp: nota {note} mantida pendente; "
+                        "o envio anterior ainda não foi confirmado."
+                    )
+                    continue
+                state["pending_notes"].pop(note)
+
+            state["pending_notes"][note] = fingerprint
+            _save_state(state_path, state)
             _send_media(driver, images, message)
             sent_notes[note] = fingerprint
+            state["pending_notes"].pop(note, None)
             _save_state(state_path, state)
             output_fn(f"WhatsApp: nota {note} enviada.")
 

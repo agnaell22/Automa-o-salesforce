@@ -31,6 +31,7 @@ PHOTO_EXTENSION = re.compile(r"\.(?:jpe?g|png|gif|webp|heic|bmp)$", re.IGNORECAS
 class ResultadoNota:
     nota: str
     status: str = "Pendente"
+    status_wfm: str = ""
     motivo: str = ""
     arquivos: list[str] = field(default_factory=list)
     erro: str = ""
@@ -473,10 +474,15 @@ def _abrir_compromisso_servico(
 
 
 def _ler_valor_campo(driver: webdriver.Chrome, label: str) -> str:
-    elements = driver.find_elements(
-        By.XPATH,
-        f"//li[.//*[normalize-space(.)='{label}']]",
-    )
+    try:
+        elements = driver.find_elements(
+            By.XPATH,
+            f"//li[.//*[normalize-space(.)='{label}']]",
+        )
+    except (TypeError, WebDriverException):
+        return ""
+    if not isinstance(elements, (list, tuple)):
+        return ""
     for element in elements:
         lines = [
             line.strip()
@@ -486,6 +492,36 @@ def _ler_valor_campo(driver: webdriver.Chrome, label: str) -> str:
         values = [line for line in lines if not line.startswith("Editar ")]
         if values:
             return " ".join(values)
+
+    try:
+        label_elements = driver.find_elements(
+            By.XPATH,
+            f"//*[normalize-space(.)='{label}']",
+        )
+    except (TypeError, WebDriverException):
+        return ""
+    if not isinstance(label_elements, (list, tuple)):
+        return ""
+
+    for label_element in label_elements:
+        try:
+            parent = label_element.find_element(By.XPATH, "..")
+            lines = [
+                line.strip()
+                for line in parent.text.splitlines()
+                if line.strip() and line.strip() != label
+            ]
+            values = [
+                line
+                for line in lines
+                if not line.startswith("Editar ")
+                and not line.startswith("Mostrar ")
+                and not line.startswith("Exibir ")
+            ]
+            if values:
+                return " ".join(values)
+        except (StaleElementReferenceException, WebDriverException):
+            continue
     return ""
 
 
@@ -510,6 +546,15 @@ def _ler_motivo(driver: webdriver.Chrome) -> str:
             and not line.strip().startswith("Exibir tudo")
         )
     return " | ".join(dict.fromkeys(value for value in values if value))
+
+
+def _ler_status_wfm(driver: webdriver.Chrome) -> str:
+    values: list[str] = []
+    for label in ("Status", "Status WFM", "Situação"):
+        value = _ler_valor_campo(driver, label)
+        if value:
+            values.append(value)
+    return " | ".join(dict.fromkeys(values))
 
 
 def _baixar_arquivos_relacionados(
@@ -821,6 +866,8 @@ def _processar_nota(
     try:
         _buscar_ordem(driver, wait, nota)
         work_order_url = driver.current_url
+        stage = "ler o status WFM da Ordem de Trabalho"
+        result.status_wfm = _ler_status_wfm(driver)
         stage = "abrir Relacionados na Ordem de Serviço"
         _abrir_aba_relacionados(driver, wait, nota)
         stage = "localizar Compromissos de Serviço relacionados"
@@ -861,6 +908,10 @@ def _processar_nota(
                         if value
                     )
                 )
+                stage = "ler o status WFM"
+                appointment_status = _ler_status_wfm(driver)
+                if not result.status_wfm:
+                    result.status_wfm = appointment_status
                 stage = "baixar os arquivos do Compromisso de Serviço"
                 result.arquivos.extend(
                     _baixar_arquivos_relacionados(
