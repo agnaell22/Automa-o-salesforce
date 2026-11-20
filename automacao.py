@@ -1,5 +1,6 @@
 import argparse
 import csv
+import ctypes
 import os
 import sys
 import tempfile
@@ -11,12 +12,42 @@ from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
 
-DEFAULT_WORKBOOK = Path(r"C:\projetos\automacao-salesforce\Geoex_Metropolitana.xlsx")
-DEFAULT_OUTPUT = Path(r"C:\projetos\automacao-salesforce\Respostas")
+def _windows_documents_directory() -> Path:
+    folder_path = ctypes.create_unicode_buffer(32768)
+    get_folder_path = ctypes.windll.shell32.SHGetFolderPathW
+    get_folder_path.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_wchar),
+    ]
+    get_folder_path.restype = ctypes.c_long
+    result = get_folder_path(None, 5, None, 0, folder_path)
+    if result != 0:
+        raise OSError(result, "O Windows não informou a pasta Documentos.")
+    if not folder_path.value:
+        raise OSError("O Windows retornou a pasta Documentos vazia.")
+    return Path(folder_path.value)
+
+
+def _user_data_directory() -> Path:
+    if getattr(sys, "frozen", False):
+        return _windows_documents_directory() / "Automacao Salesforce"
+    return Path(r"D:\automação salesforce")
+
+
+if getattr(sys, "frozen", False):
+    USER_DATA_DIRECTORY = _user_data_directory()
+    DEFAULT_WORKBOOK = USER_DATA_DIRECTORY / "Geoex_Metropolitana.xlsx"
+    DEFAULT_OUTPUT = USER_DATA_DIRECTORY / "Respostas"
+else:
+    DEFAULT_WORKBOOK = Path(r"D:\automação salesforce\Geoex_Metropolitana.xlsx")
+    DEFAULT_OUTPUT = Path(r"D:\automação salesforce\Respostas")
 DEFAULT_SHEET = "Notas sem evidência"
 DEFAULT_COLUMN = "Nota"
 DEFAULT_SALESFORCE_URL = "https://wfmneoenergia.my.salesforce.com/"
-DEFAULT_WHATSAPP_GROUP = "Teste Geoex"
+DEFAULT_WHATSAPP_GROUP = "GRUPO DE PENDENCIAS - GEOEX - SALVADOR"
 REPORT_NAME = "relatorio_processamento.csv"
 LEGACY_REPORT_FIELDS = (
     "nota",
@@ -348,6 +379,35 @@ def select_notes_to_process(
     return [note for note in notes if note not in successful_notes][:limit]
 
 
+def _progress_snapshot(
+    notes: list[str],
+    report_rows: dict[str, dict[str, str]],
+    output_dir: Path,
+    *,
+    include_whatsapp: bool = True,
+) -> dict[str, int]:
+    salesforce_done = sum(
+        report_rows.get(note, {}).get("status") in SUCCESSFUL_SALESFORCE_STATUSES
+        for note in notes
+    )
+    if include_whatsapp:
+        from whatsapp import media_delivery_progress
+
+        whatsapp_total, whatsapp_sent = media_delivery_progress(
+            output_dir,
+            report_rows,
+        )
+    else:
+        whatsapp_total = 0
+        whatsapp_sent = 0
+    return {
+        "salesforce_done": salesforce_done,
+        "salesforce_total": len(notes),
+        "whatsapp_sent": whatsapp_sent,
+        "whatsapp_total": whatsapp_total,
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -411,6 +471,7 @@ def main(
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
     error_fn: Callable[[str], None] | None = None,
+    progress_fn: Callable[[dict[str, int]], None] | None = None,
 ) -> int:
     args = parse_args(argv)
     try:
@@ -433,6 +494,14 @@ def main(
             notes,
             metadata,
         )
+        progress = _progress_snapshot(
+            notes,
+            existing_rows,
+            args.saida,
+            include_whatsapp=not args.enviar_whatsapp,
+        )
+        if progress_fn is not None:
+            progress_fn(progress.copy())
         if args.consultar_salesforce:
             if args.limite < 1:
                 raise ValueError("--limite deve ser maior que zero.")
@@ -462,6 +531,16 @@ def main(
                 )
                 result_updates[resultado.nota] = row
                 write_report(report_path, notes, result_updates)
+                if progress_fn is not None:
+                    current_rows = {**existing_rows, **result_updates}
+                    progress["salesforce_done"] = sum(
+                        current_rows.get(note, {}).get("status")
+                        in SUCCESSFUL_SALESFORCE_STATUSES
+                        for note in notes
+                    )
+                    if resultado.status == "Concluída" and resultado.arquivos:
+                        progress["whatsapp_total"] += 1
+                    progress_fn(progress.copy())
 
             if notes_to_process:
                 resultados = consultar_notas(
@@ -479,9 +558,23 @@ def main(
                 in SUCCESSFUL_SALESFORCE_STATUSES
                 for note in notes
             )
+            if progress_fn is not None and not args.enviar_whatsapp:
+                progress.update(
+                    _progress_snapshot(
+                        notes,
+                        {**existing_rows, **result_updates},
+                        args.saida,
+                    )
+                )
+                progress_fn(progress.copy())
         if args.enviar_whatsapp:
             existing_rows = read_existing_report(report_path)
             from whatsapp import enviar_respostas
+
+            def save_whatsapp_progress(counts: dict[str, int]) -> None:
+                progress.update(counts)
+                if progress_fn is not None:
+                    progress_fn(progress.copy())
 
             enviar_respostas(
                 args.saida,
@@ -490,6 +583,7 @@ def main(
                 args.perfil_whatsapp,
                 input_fn=input_fn,
                 output_fn=output_fn,
+                progress_fn=save_whatsapp_progress,
             )
     except (OSError, InvalidFileException, ValueError) as error:
         message = f"Erro: {error}"

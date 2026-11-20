@@ -169,6 +169,42 @@ def _note_fingerprint(
     return digest.hexdigest()
 
 
+def media_delivery_progress(
+    output_dir: Path,
+    report_rows: dict[str, dict[str, str]],
+) -> tuple[int, int]:
+    state = _load_state(_state_path(output_dir))
+    eligible = 0
+    sent = 0
+    for note, row in report_rows.items():
+        if row.get("status") not in SUCCESSFUL_SALESFORCE_STATUSES:
+            continue
+        note_dir = output_dir / note
+        images = (
+            sorted(
+                path
+                for path in note_dir.iterdir()
+                if path.is_file() and path.suffix.casefold() in IMAGE_EXTENSIONS
+            )
+            if note_dir.is_dir()
+            else []
+        )
+        if not images:
+            continue
+        eligible += 1
+        fingerprint = _note_fingerprint(
+            note,
+            _note_message(note_dir / "descricao.txt", row),
+            images,
+        )
+        if (
+            state["notes"].get(note) == fingerprint
+            and note not in state["pending_notes"]
+        ):
+            sent += 1
+    return eligible, sent
+
+
 def _visible(element: WebElement) -> bool:
     try:
         return element.is_displayed()
@@ -1363,6 +1399,7 @@ def enviar_respostas(
     profile_dir: Path | None = None,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
+    progress_fn: Callable[[dict[str, int]], None] | None = None,
 ) -> None:
     group_name = group_name.strip()
     if not group_name:
@@ -1374,6 +1411,8 @@ def enviar_respostas(
     state = _load_state(state_path)
     sent_notes = state["notes"]
     pending_notes: list[tuple[str, str, list[Path], str]] = []
+    eligible_notes = 0
+    sent_count = 0
 
     for note, row in report_rows.items():
         if row.get("status") not in SUCCESSFUL_SALESFORCE_STATUSES:
@@ -1393,6 +1432,12 @@ def enviar_respostas(
             continue
         message = _note_message(note_dir / "descricao.txt", row)
         fingerprint = _note_fingerprint(note, message, images)
+        eligible_notes += 1
+        if (
+            sent_notes.get(note) == fingerprint
+            and note not in state["pending_notes"]
+        ):
+            sent_count += 1
         if (
             sent_notes.get(note) != fingerprint
             or note in state["pending_notes"]
@@ -1406,6 +1451,16 @@ def enviar_respostas(
                 )
             )
 
+    def report_progress() -> None:
+        if progress_fn is not None:
+            progress_fn(
+                {
+                    "whatsapp_sent": sent_count,
+                    "whatsapp_total": eligible_notes,
+                }
+            )
+
+    report_progress()
     archive_pending = state.get("archive_sha256") != archive_hash
     if not pending_notes and not archive_pending:
         output_fn("WhatsApp: notas e ZIP já enviados; nenhum envio duplicado.")
@@ -1447,6 +1502,8 @@ def enviar_respostas(
             sent_notes[note] = fingerprint
             state["pending_notes"].pop(note, None)
             _save_state(state_path, state)
+            sent_count += 1
+            report_progress()
             output_fn(f"WhatsApp: nota {note} enviada.")
 
         if archive_pending:

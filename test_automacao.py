@@ -13,10 +13,17 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException,
     StaleElementReferenceException,
     TimeoutException,
+    WebDriverException,
 )
 from selenium.webdriver.common.keys import Keys
 
-from interface import build_cli_args
+import automacao
+from interface import (
+    APP_EXECUTABLE_NAME,
+    AutomationApp,
+    _install_packaged_app,
+    build_cli_args,
+)
 from automacao import (
     DEFAULT_WHATSAPP_GROUP,
     LEGACY_REPORT_FIELDS,
@@ -39,11 +46,17 @@ from salesforce import (
     _baixar_arquivos_relacionados,
     _compromissos_relacionados,
     _extract_downloaded_images,
+    _fechar_aba_registro_ativa,
+    _fechar_modal_arquivos,
+    _files_download_button,
     _matching_work_order_result,
     _modal_image_rows,
     _modal_download_button,
+    _no_work_order_results_visible,
     _processar_nota,
+    _visible_search_button,
     _visible_search_box,
+    _work_order_search_result,
     _wait_for_stable_search_box,
     _buscar_ordem,
     consultar_notas,
@@ -53,6 +66,7 @@ from salesforce import (
 )
 from whatsapp import (
     _note_message,
+    _note_fingerprint,
     _find_file_input,
     _click_attachment_button,
     _click_media_menu_item,
@@ -70,10 +84,103 @@ from whatsapp import (
     _xpath_literal,
     create_responses_archive,
     enviar_respostas,
+    media_delivery_progress,
 )
 
 
 class InterfaceTests(unittest.TestCase):
+    def test_installs_executable_sources_and_desktop_shortcut(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "download" / APP_EXECUTABLE_NAME
+            executable.parent.mkdir()
+            executable.write_bytes(b"packaged executable")
+            source_directory = root / "bundle" / "source"
+            source_directory.mkdir(parents=True)
+            for filename in ("automacao.py", "interface.py", "salesforce.py", "whatsapp.py"):
+                (source_directory / filename).write_text(
+                    f"# {filename}",
+                    encoding="utf-8",
+                )
+            install_directory = root / "LocalAppData" / "app"
+
+            with (
+                patch("interface._create_desktop_shortcut") as create_shortcut,
+                patch("interface.subprocess.Popen") as launch,
+            ):
+                installed = _install_packaged_app(
+                    executable,
+                    install_directory,
+                    source_directory,
+                )
+
+                self.assertTrue(installed)
+                installed_executable = install_directory / APP_EXECUTABLE_NAME
+                self.assertEqual(
+                    installed_executable.read_bytes(),
+                    b"packaged executable",
+                )
+                for filename in (
+                    "automacao.py",
+                    "interface.py",
+                    "salesforce.py",
+                    "whatsapp.py",
+                ):
+                    self.assertTrue(
+                        (install_directory / "source" / filename).is_file()
+                    )
+                create_shortcut.assert_called_once_with(
+                    installed_executable,
+                    install_directory,
+                )
+                launch.assert_called_once_with(
+                    [str(installed_executable)],
+                    cwd=install_directory,
+                )
+
+    def test_does_not_reinstall_when_running_from_install_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install_directory = Path(directory)
+            executable = install_directory / APP_EXECUTABLE_NAME
+            executable.touch()
+
+            with (
+                patch("interface._create_desktop_shortcut") as create_shortcut,
+                patch("interface.subprocess.Popen") as launch,
+            ):
+                installed = _install_packaged_app(
+                    executable,
+                    install_directory,
+                    install_directory / "missing-source",
+                )
+
+        self.assertFalse(installed)
+        create_shortcut.assert_not_called()
+        launch.assert_not_called()
+
+    def test_progress_counters_show_remaining_work(self):
+        app = SimpleNamespace(
+            salesforce_progress_var=Mock(),
+            whatsapp_progress_var=Mock(),
+        )
+
+        AutomationApp._update_progress(
+            app,
+            {
+                "salesforce_done": 294,
+                "salesforce_total": 807,
+                "whatsapp_sent": 211,
+                "whatsapp_total": 220,
+            },
+        )
+
+        app.salesforce_progress_var.set.assert_called_once_with(
+            "Salesforce: 294/807 concluídas; faltam consultar/reprocessar 513."
+        )
+        app.whatsapp_progress_var.set.assert_called_once_with(
+            "WhatsApp: 211/220 enviadas e confirmadas; faltam 9."
+        )
+
     def test_builds_arguments_with_custom_whatsapp_group(self):
         args = build_cli_args(
             "C:\\dados\\notas.xlsx",
@@ -314,6 +421,32 @@ class StatusComparisonTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_packaged_data_directory_uses_windows_localized_documents_folder(self):
+        localized_documents = Path(
+            r"C:\Users\Pessoa\OneDrive\Documentos"
+        )
+        with (
+            patch.object(automacao.sys, "frozen", True, create=True),
+            patch(
+                "automacao._windows_documents_directory",
+                return_value=localized_documents,
+            ) as get_documents,
+        ):
+            data_directory = automacao._user_data_directory()
+
+        get_documents.assert_called_once_with()
+        self.assertEqual(
+            data_directory,
+            localized_documents / "Automacao Salesforce",
+        )
+
+    def test_development_data_directory_remains_in_project_folder(self):
+        with patch.object(automacao.sys, "frozen", False, create=True):
+            self.assertEqual(
+                automacao._user_data_directory(),
+                Path(r"D:\automação salesforce"),
+            )
+
     def test_whatsapp_flags_use_the_configured_group_and_require_opt_in(self):
         with patch(
             "sys.argv",
@@ -536,6 +669,62 @@ class SalesforceLifecycleTests(unittest.TestCase):
         driver.quit.assert_called_once()
         driver.service.stop.assert_not_called()
 
+    def test_stops_processing_after_chrome_window_is_closed(self):
+        driver = Mock()
+        type(driver).current_url = unittest.mock.PropertyMock(
+            side_effect=WebDriverException("no such window: target window already closed")
+        )
+        on_result = Mock()
+        output = []
+        first_result = ResultadoNota(nota="123", status="Erro")
+        with (
+            patch("salesforce.criar_navegador", return_value=driver),
+            patch("salesforce._wait_for_login"),
+            patch(
+                "salesforce._processar_nota",
+                return_value=first_result,
+            ) as process_note,
+        ):
+            results = consultar_notas(
+                ["123", "456", "789"],
+                "https://example.my.salesforce.com/",
+                Path("."),
+                None,
+                on_result=on_result,
+                output_fn=output.append,
+            )
+
+        self.assertEqual(results, [first_result])
+        process_note.assert_called_once_with(driver, Path("."), "123")
+        on_result.assert_called_once_with(first_result)
+        self.assertIn("interrompida", first_result.erro)
+        self.assertTrue(any("interrompendo a fila" in line for line in output))
+        driver.quit.assert_called_once()
+
+    def test_stops_chromedriver_when_quit_fails_after_window_closes(self):
+        driver = Mock()
+        type(driver).current_url = unittest.mock.PropertyMock(
+            side_effect=WebDriverException("no such window")
+        )
+        driver.quit.side_effect = WebDriverException("no such window")
+        with (
+            patch("salesforce.criar_navegador", return_value=driver),
+            patch("salesforce._wait_for_login"),
+            patch(
+                "salesforce._processar_nota",
+                return_value=ResultadoNota(nota="123", status="Erro"),
+            ),
+        ):
+            results = consultar_notas(
+                ["123", "456"],
+                "https://example.my.salesforce.com/",
+                Path("."),
+                None,
+            )
+
+        self.assertEqual(len(results), 1)
+        driver.service.stop.assert_called_once()
+
     def test_chrome_uses_a_detached_profile_for_manual_login(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -548,12 +737,14 @@ class SalesforceLifecycleTests(unittest.TestCase):
 
             options = chrome.call_args.kwargs["options"]
             self.assertTrue(options.experimental_options["detach"])
+            self.assertEqual(options.page_load_strategy, "eager")
 
 
 class SalesforceNavigationTests(unittest.TestCase):
     def test_search_result_is_activated_with_javascript_click(self):
         search_button = Mock()
         search_box = Mock()
+        search_box.tag_name = "input"
         search_result = Mock()
         first_wait = Mock()
         first_wait.until.return_value = search_button
@@ -576,12 +767,21 @@ class SalesforceNavigationTests(unittest.TestCase):
                 "salesforce._wait_for_stable_search_box",
                 side_effect=[False, False, search_box],
             ),
+            patch("salesforce._fechar_modal_arquivos", return_value=False),
+            patch("salesforce._fechar_aba_registro_ativa") as close_record,
         ):
             _buscar_ordem(driver, first_wait, "1030177305")
 
+        close_record.assert_not_called()
         search_button.click.assert_called_once()
         search_box.click.assert_not_called()
+        search_box.clear.assert_called_once_with()
         search_box.send_keys.assert_called_once_with("1030177305")
+        search_calls = [call[0] for call in search_box.mock_calls]
+        self.assertLess(
+            search_calls.index("clear"),
+            search_calls.index("send_keys"),
+        )
         self.assertEqual(driver.execute_script.call_count, 2)
         self.assertIs(driver.execute_script.call_args_list[0].args[1], search_button)
         self.assertIs(driver.execute_script.call_args_list[1].args[1], search_result)
@@ -690,7 +890,7 @@ class SalesforceNavigationTests(unittest.TestCase):
         driver.execute_script.return_value = visible_input
 
         self.assertIs(_visible_search_box(driver), visible_input)
-        script = driver.execute_script.call_args.args[0]
+        script = driver.execute_script.call_args_list[0].args[0]
         self.assertIn("element.shadowRoot", script)
         self.assertIn("type === 'search'", script)
         self.assertIn("rect.width > 0", script)
@@ -698,6 +898,54 @@ class SalesforceNavigationTests(unittest.TestCase):
         self.assertIn("topElement.shadowRoot.elementFromPoint", script)
         self.assertIn("return topElement === element", script)
         self.assertIn("isAccessibleFromPage(element)", script)
+
+    def test_search_button_searches_open_shadow_roots(self):
+        driver = Mock()
+        button = Mock()
+        driver.execute_script.return_value = button
+
+        self.assertIs(_visible_search_button(driver), button)
+        script = driver.execute_script.call_args.args[0]
+        self.assertIn("element.shadowRoot", script)
+        self.assertIn('button[aria-label="Search Salesforce"]', script)
+
+    def test_intercepted_search_button_uses_the_active_salesforce_search_field(self):
+        search_button = Mock()
+        search_button.click.side_effect = ElementClickInterceptedException(
+            "Search field overlays the button"
+        )
+        search_box = Mock()
+        search_box.tag_name = "lightning-input"
+        search_box.get_attribute.return_value = "saInput"
+        search_result = Mock()
+        wait = Mock()
+        wait.until.return_value = search_button
+        result_wait = Mock()
+        result_wait.until.return_value = search_result
+        navigation_wait = Mock()
+        driver = Mock()
+        driver.current_url = (
+            "https://example.lightning.force.com/lightning/r/WorkOrder/123/view"
+        )
+        driver.switch_to.active_element = search_box
+        navigation_wait.until.side_effect = lambda condition: condition(driver)
+
+        with (
+            patch(
+                "salesforce.WebDriverWait",
+                side_effect=[result_wait, navigation_wait],
+            ),
+            patch(
+                "salesforce._wait_for_stable_search_box",
+                side_effect=[False, False],
+            ),
+            patch("salesforce._fechar_modal_arquivos", return_value=False),
+        ):
+            _buscar_ordem(driver, wait, "1030177305")
+
+        search_box.send_keys.assert_any_call(Keys.CONTROL, "a", Keys.BACKSPACE)
+        search_box.send_keys.assert_any_call("1030177305")
+        self.assertEqual(wait.until.call_count, 1)
 
     def test_search_box_waits_for_stable_geometry(self):
         search_box = Mock()
@@ -746,24 +994,48 @@ class SalesforceNavigationTests(unittest.TestCase):
             driver.execute_script.call_args.args[0],
         )
 
-    def test_ignores_hidden_search_results(self):
-        hidden = SimpleNamespace(
-            is_displayed=lambda: False,
-            is_enabled=lambda: True,
-            text="04596443 Ordem de trabalho • COE_CS1030177305",
-        )
-        visible = SimpleNamespace(
-            is_displayed=lambda: True,
-            is_enabled=lambda: True,
-            text="04596443 Ordem de trabalho • COE_CS1030177305",
-        )
+    def test_search_results_match_inside_shadow_dom_without_case_sensitivity(self):
         driver = Mock()
-        driver.find_elements.return_value = [hidden, visible]
+        result = Mock()
+        driver.execute_script.return_value = result
 
         self.assertIs(
             _matching_work_order_result(driver, "1030177305"),
-            visible,
+            result,
         )
+        script = driver.execute_script.call_args.args[0]
+        self.assertIn("element.shadowRoot", script)
+        self.assertIn("notePattern.test(label)", script)
+        self.assertIn(r"'(^|\\D)' + note + '(\\D|$)'", script)
+        self.assertIn("ordem", script)
+        self.assertIn("toLowerCase()", script)
+
+    def test_explicit_no_results_is_distinguished_from_a_search_timeout(self):
+        driver = Mock()
+        driver.execute_script.side_effect = [False, True]
+
+        self.assertEqual(_work_order_search_result(driver, "1030177305"), "not-found")
+
+        driver.execute_script.side_effect = None
+        driver.execute_script.return_value = True
+        self.assertTrue(_no_work_order_results_visible(driver))
+
+    def test_search_timeout_does_not_claim_that_the_work_order_is_missing(self):
+        search_box = Mock()
+        search_box.tag_name = "input"
+        result_wait = Mock()
+        result_wait.until.side_effect = TimeoutException()
+
+        with (
+            patch(
+                "salesforce._wait_for_stable_search_box",
+                return_value=search_box,
+            ),
+            patch("salesforce.WebDriverWait", return_value=result_wait),
+            patch("salesforce._fechar_modal_arquivos", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "não confirmou se existe"):
+                _buscar_ordem(Mock(), Mock(), "1030177305")
 
     def test_extracts_all_images_from_zip_and_ignores_other_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -796,6 +1068,50 @@ class SalesforceNavigationTests(unittest.TestCase):
 
 
 class WhatsAppDeliveryTests(unittest.TestCase):
+    def test_media_progress_counts_only_currently_confirmed_deliveries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "Respostas"
+            note_dir = output_dir / "123"
+            note_dir.mkdir(parents=True)
+            description = note_dir / "descricao.txt"
+            description.write_text("Nota: 123\n", encoding="utf-8")
+            image = note_dir / "123_foto.jpg"
+            image.write_bytes(b"image")
+            row = {
+                "status": "Concluída",
+                "status_wfm": "Incompleto",
+                "motivo_nao_conclusao": "",
+            }
+            rows = {"123": row}
+
+            self.assertEqual(media_delivery_progress(output_dir, rows), (1, 0))
+
+            state_path = root / ".Respostas_whatsapp_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "notes": {
+                            "123": _note_fingerprint(
+                                "123",
+                                _note_message(description, row),
+                                [image],
+                            )
+                        },
+                        "pending_notes": {"123": "pending-fingerprint"},
+                        "archive_sha256": "",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(media_delivery_progress(output_dir, rows), (1, 0))
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["pending_notes"] = {}
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            self.assertEqual(media_delivery_progress(output_dir, rows), (1, 1))
+
     def test_document_message_lookup_checks_filename_and_accessible_status(self):
         driver = Mock()
         expected = [
@@ -1669,6 +1985,7 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                     "browser_closed"
                 )
                 confirmation_prompts = []
+                progress_updates = []
                 enviar_respostas(
                     output_dir,
                     report_rows,
@@ -1676,8 +1993,16 @@ class WhatsAppDeliveryTests(unittest.TestCase):
                     input_fn=lambda prompt: (
                         confirmation_prompts.append(prompt) or "s"
                     ),
+                    progress_fn=progress_updates.append,
                 )
 
+            self.assertEqual(
+                progress_updates,
+                [
+                    {"whatsapp_sent": 0, "whatsapp_total": 1},
+                    {"whatsapp_sent": 1, "whatsapp_total": 1},
+                ],
+            )
             self.assertEqual(
                 confirmation_prompts,
                 [
@@ -1926,6 +2251,85 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             create_browser.assert_not_called()
 
 class SalesforceDownloadTests(unittest.TestCase):
+    def test_files_button_is_found_inside_shadow_dom(self):
+        driver = Mock()
+        button = Mock()
+        driver.execute_script.return_value = button
+
+        result = _files_download_button(driver)
+
+        self.assertIs(result, button)
+        script = driver.execute_script.call_args.args[0]
+        self.assertIn("element.shadowRoot", script)
+        self.assertIn("baixar arquivos", script)
+        self.assertIn("aria-disabled", script)
+
+    def test_file_modal_is_closed_after_download_or_no_images(self):
+        driver = Mock()
+        modal = Mock()
+        close_button = Mock()
+        driver.execute_script.side_effect = [(modal, close_button), None, False]
+        wait = Mock()
+        wait.until.side_effect = lambda condition: condition(driver)
+
+        with patch("salesforce.WebDriverWait", return_value=wait):
+            self.assertTrue(_fechar_modal_arquivos(driver))
+
+        driver.execute_script.assert_any_call(
+            "arguments[0].click()",
+            close_button,
+        )
+
+    def test_open_file_modal_without_close_control_is_reported(self):
+        driver = Mock()
+        driver.execute_script.return_value = (Mock(), None)
+
+        with self.assertRaisesRegex(RuntimeError, "botão para fechá-la"):
+            _fechar_modal_arquivos(driver)
+
+    def test_file_modal_cleanup_runs_even_when_download_processing_fails(self):
+        driver = Mock()
+        with (
+            patch(
+                "salesforce._baixar_arquivos_relacionados_impl",
+                side_effect=RuntimeError("download failed"),
+            ),
+            patch("salesforce._fechar_modal_arquivos") as close_modal,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                _baixar_arquivos_relacionados(
+                    driver,
+                    Mock(),
+                    "1030177305",
+                    Path("."),
+                )
+
+        close_modal.assert_called_once_with(driver)
+
+    def test_active_salesforce_record_tab_can_be_closed_without_closing_chrome(self):
+        driver = Mock()
+        tab = Mock()
+        close_button = Mock()
+        driver.execute_script.side_effect = [
+            (tab, close_button),
+            None,
+            StaleElementReferenceException("tab was closed"),
+        ]
+        wait = Mock()
+        wait.until.side_effect = lambda condition: condition(driver)
+
+        with patch("salesforce.WebDriverWait", return_value=wait):
+            self.assertTrue(_fechar_aba_registro_ativa(driver))
+
+        driver.execute_script.assert_any_call(
+            "arguments[0].click()",
+            close_button,
+        )
+        script = driver.execute_script.call_args_list[0].args[0]
+        self.assertIn('[role="tab"][aria-selected="true"]', script)
+        self.assertIn("service appointment", script)
+        self.assertIn("return [activeTab, closeButton]", script)
+
     def test_empty_zip_returns_no_images_without_failing(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory)
@@ -1977,6 +2381,10 @@ class SalesforceDownloadTests(unittest.TestCase):
                 ),
                 patch("salesforce._abrir_compromisso_servico"),
                 patch("salesforce._ler_motivo", return_value=""),
+                patch(
+                    "salesforce._fechar_aba_registro_ativa",
+                    return_value=True,
+                ) as close_record_tab,
                 patch("salesforce._baixar_arquivos_relacionados", return_value=[]),
             ):
                 result = _processar_nota(
@@ -1988,6 +2396,7 @@ class SalesforceDownloadTests(unittest.TestCase):
             self.assertEqual(result.status, "Sem imagens")
             self.assertEqual(result.arquivos, [])
             self.assertEqual(result.erro, "")
+            close_record_tab.assert_called_once_with(driver)
 
     def test_opens_related_service_appointment_before_downloading_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2016,6 +2425,10 @@ class SalesforceDownloadTests(unittest.TestCase):
                 ) as open_appointment,
                 patch("salesforce._ler_motivo", return_value=""),
                 patch(
+                    "salesforce._fechar_aba_registro_ativa",
+                    return_value=True,
+                ) as close_record_tab,
+                patch(
                     "salesforce._baixar_arquivos_relacionados",
                     side_effect=lambda *_args: events.append("download")
                     or ["1030177305_foto.jpg"],
@@ -2037,6 +2450,41 @@ class SalesforceDownloadTests(unittest.TestCase):
             open_appointment.assert_called_once()
             download_files.assert_called_once()
             driver.get.assert_not_called()
+            close_record_tab.assert_called_once_with(driver)
+
+    def test_reads_wfm_status_from_service_appointment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            driver = Mock()
+            driver.current_url = (
+                "https://example.lightning.force.com/lightning/r/WorkOrder/123/view"
+            )
+            with (
+                patch("salesforce.WebDriverWait", return_value=Mock()),
+                patch("salesforce._buscar_ordem"),
+                patch("salesforce._abrir_aba_relacionados"),
+                patch(
+                    "salesforce._compromissos_relacionados",
+                    return_value=[
+                        "https://example.lightning.force.com/lightning/r/"
+                        "08pRo000000000001/view"
+                    ],
+                ),
+                patch("salesforce._abrir_compromisso_servico"),
+                patch("salesforce._ler_motivo", return_value=""),
+                patch(
+                    "salesforce._ler_status_wfm",
+                    return_value="Incompleto",
+                ) as read_status,
+                patch("salesforce._fechar_aba_registro_ativa", return_value=True),
+                patch(
+                    "salesforce._baixar_arquivos_relacionados",
+                    return_value=["123_foto.jpg"],
+                ),
+            ):
+                result = _processar_nota(driver, Path(directory), "123")
+
+        self.assertEqual(result.status_wfm, "Incompleto")
+        read_status.assert_called_once_with(driver)
 
     def test_empty_file_modal_returns_no_images_without_clicking_download(self):
         toolbar_button = Mock()
@@ -2068,6 +2516,7 @@ class SalesforceDownloadTests(unittest.TestCase):
                 "salesforce.WebDriverWait",
                 side_effect=[modal_wait, file_list_wait],
             ),
+            patch("salesforce._fechar_modal_arquivos"),
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2076,12 +2525,16 @@ class SalesforceDownloadTests(unittest.TestCase):
                 Path(directory),
             )
         self.assertEqual(result, [])
-        toolbar_button.click.assert_called_once()
+        toolbar_button.click.assert_not_called()
+        driver.execute_script.assert_any_call(
+            "arguments[0].click()",
+            toolbar_button,
+        )
         driver.execute_script.assert_any_call(
             "arguments[0].click()",
             close_button,
         )
-        self.assertEqual(driver.execute_script.call_count, 3)
+        self.assertEqual(driver.execute_script.call_count, 4)
 
     def test_modal_image_rows_are_found_inside_shadow_dom(self):
         checkbox = Mock()
@@ -2176,6 +2629,7 @@ class SalesforceDownloadTests(unittest.TestCase):
             ),
             patch("salesforce.time.monotonic", side_effect=[0, 0, 0, 3, 3]),
             patch("salesforce.time.sleep"),
+            patch("salesforce._fechar_modal_arquivos"),
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2210,7 +2664,6 @@ class SalesforceDownloadTests(unittest.TestCase):
                 archive.writestr("equipe/foto.jpg", b"image")
                 archive.writestr("equipe/relatorio.pdf", b"document")
 
-        toolbar_button.click.side_effect = create_zip
         initial_wait = Mock()
         initial_wait.until.return_value = toolbar_button
         download_wait = Mock()
@@ -2218,11 +2671,18 @@ class SalesforceDownloadTests(unittest.TestCase):
         driver = Mock()
         driver.find_elements.return_value = []
 
+        def click_files_button(script, button):
+            if script == "arguments[0].click()" and button is toolbar_button:
+                create_zip()
+
+        driver.execute_script.side_effect = click_files_button
+
         with (
             tempfile.TemporaryDirectory() as directory,
             patch("salesforce.WebDriverWait", return_value=download_wait),
             patch("salesforce.time.monotonic", side_effect=[0, 0, 0, 3, 3]),
             patch("salesforce.time.sleep"),
+            patch("salesforce._fechar_modal_arquivos"),
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2238,7 +2698,11 @@ class SalesforceDownloadTests(unittest.TestCase):
             )
             self.assertFalse((Path(directory) / "download.zip").exists())
 
-        toolbar_button.click.assert_called_once()
+        toolbar_button.click.assert_not_called()
+        driver.execute_script.assert_any_call(
+            "arguments[0].click()",
+            toolbar_button,
+        )
         driver.find_elements.assert_called_once()
 
     def test_empty_file_table_with_headers_returns_no_images(self):
@@ -2270,6 +2734,7 @@ class SalesforceDownloadTests(unittest.TestCase):
                 "salesforce.WebDriverWait",
                 side_effect=[modal_wait, file_list_wait],
             ),
+            patch("salesforce._fechar_modal_arquivos"),
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2279,7 +2744,7 @@ class SalesforceDownloadTests(unittest.TestCase):
             )
 
         self.assertEqual(result, [])
-        self.assertEqual(driver.execute_script.call_count, 3)
+        self.assertEqual(driver.execute_script.call_count, 4)
         driver.execute_script.assert_any_call(
             "arguments[0].click()",
             close_button,
@@ -2295,6 +2760,7 @@ class SalesforceDownloadTests(unittest.TestCase):
                     "salesforce._abrir_aba_relacionados",
                     side_effect=RuntimeError("aba Relacionados indisponível"),
                 ),
+                patch("salesforce._fechar_aba_registro_ativa", return_value=True),
                 patch("salesforce._compromissos_relacionados"),
                 patch("salesforce._ler_motivo", return_value=""),
                 patch(

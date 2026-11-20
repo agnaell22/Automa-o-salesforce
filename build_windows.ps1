@@ -4,7 +4,7 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $Desktop = [Environment]::GetFolderPath("Desktop")
 $BuildDirectory = Join-Path $ProjectRoot "build"
-$ExecutableName = "Automacao Salesforce.exe"
+$ExecutableName = "Automacao Salesforce Instalador.exe"
 $BuiltExecutable = Join-Path $BuildDirectory $ExecutableName
 $DesktopExecutable = Join-Path $Desktop $ExecutableName
 
@@ -22,8 +22,12 @@ try {
         --noconfirm `
         --onefile `
         --windowed `
-        --name "Automacao Salesforce" `
+        --name "Automacao Salesforce Instalador" `
         --collect-all selenium `
+        --add-data "$ProjectRoot\automacao.py;source" `
+        --add-data "$ProjectRoot\interface.py;source" `
+        --add-data "$ProjectRoot\salesforce.py;source" `
+        --add-data "$ProjectRoot\whatsapp.py;source" `
         --distpath $BuildDirectory `
         --workpath (Join-Path $BuildDirectory "work") `
         --specpath $BuildDirectory `
@@ -34,10 +38,10 @@ try {
 
     try {
         Copy-Item -LiteralPath $BuiltExecutable -Destination $DesktopExecutable -Force
-        Write-Output "Executável atualizado: $DesktopExecutable"
+        Write-Output "Pacote instalador criado: $DesktopExecutable"
     }
     catch {
-        $UpdatedExecutable = Join-Path $Desktop "Automacao Salesforce atualizado.exe"
+        $UpdatedExecutable = Join-Path $Desktop "Automacao Salesforce Instalador atualizado.exe"
         Copy-Item -LiteralPath $BuiltExecutable -Destination $UpdatedExecutable -Force
         Write-Warning (
             "O executável da Área de Trabalho está aberto e não pôde ser substituído. " +
@@ -45,7 +49,11 @@ try {
             "e execute este script novamente para atualizar o nome principal."
         )
     }
-    Write-Output "Os scripts-fonte permanecem no projeto: $ProjectRoot"
+    Write-Output (
+        "No primeiro início, o executável instala o aplicativo em " +
+        "%LOCALAPPDATA%\AutomacaoSalesforce\app, copia os fontes incluídos " +
+        "e cria um atalho na Área de Trabalho do usuário."
+    )
 }
 finally {
     Pop-Location

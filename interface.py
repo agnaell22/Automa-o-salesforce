@@ -1,4 +1,8 @@
+import ctypes
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -13,6 +17,10 @@ from automacao import (
     DEFAULT_WORKBOOK,
     main as run_automation,
 )
+
+APP_INSTALL_DIRECTORY_NAME = "AutomacaoSalesforce"
+APP_EXECUTABLE_NAME = "Automacao Salesforce.exe"
+SOURCE_FILES = ("automacao.py", "interface.py", "salesforce.py", "whatsapp.py")
 
 
 def build_cli_args(
@@ -42,6 +50,91 @@ def build_cli_args(
     return args
 
 
+def _create_desktop_shortcut(executable: Path, working_directory: Path) -> None:
+    def quote_powershell(value: Path) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$desktop = [Environment]::GetFolderPath('Desktop'); "
+        "if (-not (Test-Path -LiteralPath $desktop -PathType Container)) "
+        "{ throw \"Desktop folder not found: $desktop\" }; "
+        "$shell = New-Object -ComObject WScript.Shell; "
+        "$shortcut = $shell.CreateShortcut((Join-Path $desktop "
+        "'Automacao Salesforce.lnk')); "
+        f"$shortcut.TargetPath = {quote_powershell(executable)}; "
+        f"$shortcut.WorkingDirectory = {quote_powershell(working_directory)}; "
+        "$shortcut.Save()"
+    )
+    subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _install_packaged_app(
+    executable: Path,
+    install_directory: Path,
+    bundled_source_directory: Path,
+) -> bool:
+    installed_executable = install_directory / APP_EXECUTABLE_NAME
+    if executable.resolve() == installed_executable.resolve():
+        return False
+
+    missing_sources = [
+        filename
+        for filename in SOURCE_FILES
+        if not (bundled_source_directory / filename).is_file()
+    ]
+    if missing_sources:
+        raise FileNotFoundError(
+            "O pacote não contém todos os fontes necessários: "
+            + ", ".join(missing_sources)
+        )
+
+    install_directory.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(executable, installed_executable)
+    source_directory = install_directory / "source"
+    source_directory.mkdir(exist_ok=True)
+    for filename in SOURCE_FILES:
+        shutil.copy2(
+            bundled_source_directory / filename,
+            source_directory / filename,
+        )
+
+    _create_desktop_shortcut(installed_executable, install_directory)
+    subprocess.Popen([str(installed_executable)], cwd=install_directory)
+    return True
+
+
+def _install_if_packaged() -> bool:
+    if not getattr(sys, "frozen", False):
+        return False
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        raise RuntimeError("A variável LOCALAPPDATA não está disponível.")
+
+    install_directory = (
+        Path(local_app_data) / APP_INSTALL_DIRECTORY_NAME / "app"
+    )
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if not bundled_root:
+        raise RuntimeError("Não foi possível localizar os arquivos do pacote.")
+    return _install_packaged_app(
+        Path(sys.executable),
+        install_directory,
+        Path(bundled_root) / "source",
+    )
+
+
 class AutomationApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -58,6 +151,12 @@ class AutomationApp:
         self.consult_var = tk.BooleanVar(value=True)
         self.send_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Pronto para iniciar.")
+        self.salesforce_progress_var = tk.StringVar(
+            value="Salesforce: sem dados carregados."
+        )
+        self.whatsapp_progress_var = tk.StringVar(
+            value="WhatsApp: sem dados carregados."
+        )
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
@@ -66,7 +165,7 @@ class AutomationApp:
         container = ttk.Frame(self.root, padding=16)
         container.pack(fill=tk.BOTH, expand=True)
         container.columnconfigure(1, weight=1)
-        container.rowconfigure(6, weight=1)
+        container.rowconfigure(7, weight=1)
 
         ttk.Label(
             container,
@@ -135,8 +234,17 @@ class AutomationApp:
             row=5, column=1, sticky=tk.EW, pady=(5, 0)
         )
 
+        counters = ttk.LabelFrame(container, text="Contadores", padding=8)
+        counters.grid(row=6, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0))
+        ttk.Label(counters, textvariable=self.salesforce_progress_var).pack(
+            anchor=tk.W
+        )
+        ttk.Label(counters, textvariable=self.whatsapp_progress_var).pack(
+            anchor=tk.W
+        )
+
         log_frame = ttk.LabelFrame(container, text="Andamento", padding=8)
-        log_frame.grid(row=6, column=0, columnspan=3, sticky=tk.NSEW, pady=(8, 8))
+        log_frame.grid(row=7, column=0, columnspan=3, sticky=tk.NSEW, pady=(8, 8))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
         self.log = tk.Text(log_frame, height=12, wrap=tk.WORD, state=tk.DISABLED)
@@ -146,7 +254,7 @@ class AutomationApp:
         self.log.configure(yscrollcommand=scrollbar.set)
 
         footer = ttk.Frame(container)
-        footer.grid(row=7, column=0, columnspan=3, sticky=tk.EW)
+        footer.grid(row=8, column=0, columnspan=3, sticky=tk.EW)
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.status_var).grid(
             row=0, column=0, sticky=tk.W
@@ -313,11 +421,29 @@ class AutomationApp:
                 error_fn=lambda message: self.root.after(
                     0, self._append_log, message
                 ),
+                progress_fn=lambda counts: self.root.after(
+                    0, self._update_progress, counts
+                ),
             )
             self.root.after(0, self._finish, result == 0)
         except Exception as error:
             self.root.after(0, self._append_log, f"Erro inesperado: {error}")
             self.root.after(0, self._finish, False)
+
+    def _update_progress(self, counts: dict[str, int]) -> None:
+        salesforce_done = counts.get("salesforce_done", 0)
+        salesforce_total = counts.get("salesforce_total", 0)
+        whatsapp_sent = counts.get("whatsapp_sent", 0)
+        whatsapp_total = counts.get("whatsapp_total", 0)
+        self.salesforce_progress_var.set(
+            f"Salesforce: {salesforce_done}/{salesforce_total} concluídas; "
+            f"faltam consultar/reprocessar "
+            f"{salesforce_total - salesforce_done}."
+        )
+        self.whatsapp_progress_var.set(
+            f"WhatsApp: {whatsapp_sent}/{whatsapp_total} enviadas e "
+            f"confirmadas; faltam {whatsapp_total - whatsapp_sent}."
+        )
 
     def _finish(self, succeeded: bool) -> None:
         self.progress.stop()
@@ -338,6 +464,18 @@ class AutomationApp:
 
 
 def main() -> None:
+    try:
+        if _install_if_packaged():
+            return
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            f"Não foi possível instalar a automação para este usuário:\n{error}",
+            "Instalação da Automação Salesforce",
+            0x10,
+        )
+        return
+
     root = tk.Tk()
     AutomationApp(root)
     root.mainloop()

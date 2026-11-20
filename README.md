@@ -40,22 +40,36 @@ e/ou enviar pelo WhatsApp. O campo **Nome exato do grupo WhatsApp** pode ser
 alterado antes de iniciar. Quando o envio estiver habilitado, a interface pede
 confirmação mostrando o grupo escolhido. O andamento e os erros aparecem na
 própria janela, e o botão **Abrir relatório** abre o CSV após sua criação.
+Os contadores mostram quantas notas foram concluídas no Salesforce e quantas
+mensagens com imagens tiveram envio confirmado no WhatsApp, além do que ainda
+falta consultar/reprocessar ou enviar. Eles são reconstruídos a partir do
+relatório e do estado de envios salvos; após uma interrupção, basta abrir a
+interface novamente para consultar o progresso persistido.
 O login do Salesforce e a leitura do QR Code do WhatsApp continuam sendo feitos
 nas janelas dedicadas do Chrome.
 
-Para gerar o executável Windows e colocá-lo na Área de Trabalho, instale as
-dependências de empacotamento uma vez e execute o script do projeto:
+Para gerar o executável instalador Windows, instale as dependências de
+empacotamento no computador de desenvolvimento e execute:
 
 ```powershell
 python -m pip install -r requirements-build.txt
 .\build_windows.ps1
 ```
 
-O executável será criado como `Automacao Salesforce.exe` na Área de Trabalho;
-os scripts-fonte permanecem nesta pasta do projeto. O executável inclui o
-Python e as bibliotecas do programa, mas o Chrome continua sendo necessário
-para as automações do Salesforce e WhatsApp. Para gerar uma versão atualizada
-após mudanças no código, execute `.\build_windows.ps1` novamente.
+O arquivo `Automacao Salesforce Instalador.exe` gerado na Área de Trabalho pode ser
+copiado para outro computador Windows. No primeiro início, ele instala uma
+cópia do executável e os fontes Python em
+`%LOCALAPPDATA%\AutomacaoSalesforce\app`, cria um atalho na Área de Trabalho e
+abre a interface instalada. A instalação é por usuário e não requer escrita
+na raiz do disco nem privilégios de administrador.
+
+Os dados de trabalho usam a pasta **Documentos** resolvida pelo próprio Windows
+(incluindo nomes localizados e redirecionamentos, como OneDrive), dentro de
+`Automacao Salesforce`; a planilha não é embutida no pacote. Se ela não estiver
+nessa pasta, selecione-a na interface.
+O executável inclui Python, bibliotecas e os fontes, mas o Chrome continua
+sendo necessário para as automações Salesforce e WhatsApp. Para atualizar,
+gere o pacote novo e execute-o; ele atualiza a cópia instalada e o atalho.
 
 O programa cria uma pasta por nota com `descricao.txt` contendo Texto code
 ação, Código de ação, Data encermto. e CenTrab respon. Também registra esses
@@ -79,7 +93,7 @@ consultas ao Salesforce, pois os resultados são gravados progressivamente.
 ## Consultar uma nota no Salesforce
 
 O modo Salesforce é opt-in e consulta uma nota por execução por padrão. Feche
-eventuais janelas já abertas pelo perfil dedicado antes de iniciar:
+eventuais janelas antigas já abertas pelo perfil dedicado antes de iniciar:
 
 ```powershell
 python automacao.py --consultar-salesforce
@@ -102,6 +116,14 @@ salva na pasta da nota, sem abrir o seletor de destino do sistema. Quando o
 Salesforce entrega um ZIP, a automação aguarda o download terminar, extrai todas
 as imagens e remove o ZIP. Os nomes das imagens recebem o número da nota como
 prefixo.
+Depois de cada nota, a automação fecha a janela de seleção de arquivos e a guia
+ativa da Ordem de Serviço ou do Compromisso de Serviço, inclusive quando não há
+imagens ou ocorre uma falha. Isso evita que registros e modais se acumulem e
+interceptem a busca seguinte.
+Para evitar fechar um registro válido durante o carregamento, a seleção da OS
+é validada pelo número completo da nota na sugestão de pesquisa; o código não
+rejeita a OS com base no campo `Nota` da página, que pode não corresponder ao
+campo indexado pela pesquisa do Salesforce.
 
 Notas sem imagens ficam marcadas como `Sem imagens`. Se houver várias imagens
 no ZIP, todas as imagens reconhecidas são extraídas; outros tipos de arquivo
@@ -126,6 +148,9 @@ antigas pendentes, com erro ou parciais podem ser tentadas novamente. Cada
 resultado é salvo no relatório assim que a nota termina, permitindo retomar a
 fila sem reprocessar as notas já concluídas. Se não houver notas para processar,
 o Chrome não será aberto.
+Se a janela do Chrome ou a sessão Selenium for encerrada durante a fila, a
+automação salva o erro da nota atual e interrompe as consultas restantes em vez
+de continuar tentando com uma sessão inválida.
 
 Os downloads dependem do acesso do Chrome aos arquivos do Salesforce e podem
 falhar se a rede ou a sessão da organização bloquear os arquivos. Erros são
