@@ -6,10 +6,15 @@ opção explícita `--consultar-salesforce`.
 
 ## Dados configurados
 
-- Planilha: `C:\automação salesforce\Geoex_Metropolitana.xlsx`
-- Aba: `Notas sem evidências`
+No ambiente de desenvolvimento, os padrões atuais são:
+
+- Planilha: `D:\automação salesforce\Geoex_Metropolitana.xlsx`
+- Aba: `Notas sem evidência`
 - Coluna: `Nota`
-- Saída: `C:\automação salesforce\Respostas`
+- Saída: `D:\automação salesforce\Respostas`
+
+No executável instalado, os dados ficam por padrão em `Automacao Salesforce`,
+dentro de Documentos, conforme a localização resolvida pelo Windows.
 
 ## Preparar a fila
 
@@ -23,7 +28,7 @@ python automacao.py
 Os caminhos podem ser substituídos por argumentos:
 
 ```powershell
-python automacao.py --planilha "C:\caminho\notas.xlsx" --aba "Notas sem evidências" --coluna "Nota" --saida "C:\caminho\Respostas"
+python automacao.py --planilha "C:\caminho\notas.xlsx" --aba "Notas sem evidência" --coluna "Nota" --saida "C:\caminho\Respostas"
 ```
 
 ### Interface desktop
@@ -169,8 +174,9 @@ python automacao.py --enviar-whatsapp
 O Chrome usa um perfil separado em
 `%LOCALAPPDATA%\SalesforceAutomation\WhatsAppProfile`. Na primeira execução,
 leia manualmente o QR Code do WhatsApp Web. O programa procura o grupo pelo
-nome exato informado (padrão: `Teste Geoex`) e pede confirmação no terminal
-uma vez antes de iniciar os envios. Após a confirmação, as notas e o ZIP são
+nome exato informado (padrão atual:
+`GRUPO DE PENDENCIAS - GEOEX - SALVADOR`) e pede confirmação no terminal uma
+vez antes de iniciar os envios. Após a confirmação, as notas e o ZIP são
 enviados automaticamente, sem confirmações individuais. Só são publicadas
 notas com status `Concluída` e imagens; notas sem imagens, pendentes ou com
 erro não são publicadas individualmente. Uma imagem é anexada pelo seletor de
@@ -229,3 +235,43 @@ Compromisso de Serviço correspondente e baixa os arquivos desse registro. Os
 testes automatizados cobrem a estabilização da busca, a navegação para
 Compromissos relacionados, ZIP, modal e download direto. Valide primeiro com
 `--limite 1`.
+
+## Estado da validação e pendências (25-11-2026)
+
+### Verificado nesta versão
+
+- Execução real no Salesforce com `--limite 3`: as três notas consultadas
+  terminaram como `Concluída`. O log mostrou uma Ordem de Serviço e um
+  Compromisso de Serviço por nota, além dos nomes dos arquivos e da pasta de
+  destino de cada nota. Foram baixadas uma imagem, uma imagem e três imagens,
+  respectivamente. Isso confirma o fluxo para essa amostra pequena, não para
+  filas grandes nem para registros com vários compromissos.
+- O executável instalador foi construído em Windows 11 com Python 3.13.6 e
+  PyInstaller 6.22.3, sem substituir os executáveis existentes. O arquivo está
+  em `build\verification\dist\Automacao Salesforce Instalador.exe` e o
+  conteúdo do pacote inclui os quatro módulos Python necessários. A compilação
+  em si passou; ainda não foi validada a instalação e execução em outro
+  computador.
+- A suíte tem 108 testes. Nesta execução, 107 passaram e um falhou porque o
+  teste espera o grupo WhatsApp antigo `Pendências Geoex - Metropolitana`,
+  enquanto a configuração atual usa `GRUPO DE PENDENCIAS - GEOEX - SALVADOR`.
+  É preciso decidir qual nome é o desejado e alinhar teste e configuração.
+
+### Avaliar em testes posteriores
+
+- Aumentar gradualmente o volume Salesforce e acompanhar lentidão, falhas de
+  navegação, retomada após erro e notas com múltiplos Compromissos de Serviço.
+- Ao investigar imagens repetidas, comparar os IDs da Ordem de Serviço e do
+  Compromisso de Serviço exibidos no log, os arquivos destinados a cada nota e
+  seus hashes. Nomes de arquivo diferentes, sozinhos, não provam que as imagens
+  tenham conteúdos diferentes.
+- Conferir em uma execução real os valores `status_wfm` e `comparacao_status`
+  no relatório e validar a legenda e o destino antes de autorizar o WhatsApp.
+- Instalar e iniciar o executável em outra máquina ou em outro perfil Windows,
+  sem Python instalado. Verificar a criação/atualização da instalação e do
+  atalho, o acesso à pasta Documentos (inclusive redirecionada pelo OneDrive),
+  a seleção da planilha e o login/MFA no Chrome. O Chrome continua sendo uma
+  dependência externa do executável.
+- O build registrou avisos sobre imports opcionais `pycparser.lextab` e
+  `pycparser.yacctab`, mas terminou e gerou o arquivo. Verificar esses avisos
+  novamente apenas se o executável apresentar falha ao iniciar ou executar.

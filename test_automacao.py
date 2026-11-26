@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from openpyxl import Workbook
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
+    ElementNotInteractableException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
@@ -41,6 +42,7 @@ from automacao import (
 )
 from salesforce import (
     ResultadoNota,
+    _SearchStaleError,
     _abrir_compromisso_servico,
     _abrir_aba_relacionados,
     _baixar_arquivos_relacionados,
@@ -48,12 +50,11 @@ from salesforce import (
     _extract_downloaded_images,
     _fechar_aba_registro_ativa,
     _fechar_modal_arquivos,
-    _files_download_button,
+    _click_files_download_button,
     _matching_work_order_result,
-    _modal_image_rows,
-    _modal_download_button,
     _no_work_order_results_visible,
     _processar_nota,
+    _select_and_download_modal_images,
     _visible_search_button,
     _visible_search_box,
     _work_order_search_result,
@@ -701,6 +702,36 @@ class SalesforceLifecycleTests(unittest.TestCase):
         self.assertTrue(any("interrompendo a fila" in line for line in output))
         driver.quit.assert_called_once()
 
+    def test_stops_queue_when_search_remains_stale_after_retry(self):
+        driver = Mock()
+        on_result = Mock()
+        output = []
+        with (
+            patch("salesforce.criar_navegador", return_value=driver),
+            patch("salesforce._wait_for_login"),
+            patch(
+                "salesforce._processar_nota",
+                side_effect=_SearchStaleError("busca instável"),
+            ) as process_note,
+        ):
+            results = consultar_notas(
+                ["123", "456", "789"],
+                "https://example.my.salesforce.com/",
+                Path("."),
+                None,
+                on_result=on_result,
+                output_fn=output.append,
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].nota, "123")
+        self.assertEqual(results[0].status, "Erro")
+        self.assertEqual(results[0].erro, "busca instável")
+        process_note.assert_called_once_with(driver, Path("."), "123")
+        on_result.assert_called_once_with(results[0])
+        self.assertTrue(any("notas restantes não foram processadas" in line for line in output))
+        driver.quit.assert_called_once()
+
     def test_stops_chromedriver_when_quit_fails_after_window_closes(self):
         driver = Mock()
         type(driver).current_url = unittest.mock.PropertyMock(
@@ -741,19 +772,119 @@ class SalesforceLifecycleTests(unittest.TestCase):
 
 
 class SalesforceNavigationTests(unittest.TestCase):
-    def test_search_result_is_activated_with_javascript_click(self):
+    def test_search_retries_when_salesforce_replaces_a_stale_search_field(self):
         search_button = Mock()
         search_box = Mock()
         search_box.tag_name = "input"
-        search_result = Mock()
+        result_wait = Mock()
+        navigation_wait = Mock()
+        driver = Mock()
+        driver.current_url = "https://example.lightning.force.com/lightning"
+
+        def open_work_order(_condition):
+            driver.current_url = (
+                "https://example.lightning.force.com/"
+                "lightning/r/WorkOrder/123/view"
+            )
+            return "opened"
+
+        result_wait.until.side_effect = open_work_order
+        navigation_wait.until.side_effect = lambda condition: condition(driver)
+        wait = Mock()
+        wait.until.return_value = search_button
+
+        with (
+            patch(
+                "salesforce.WebDriverWait",
+                side_effect=[result_wait, navigation_wait],
+            ),
+            patch(
+                "salesforce._wait_for_stable_search_box",
+                side_effect=[
+                    StaleElementReferenceException("search input rerendered"),
+                    False,
+                    search_box,
+                ],
+            ),
+            patch("salesforce._fechar_modal_arquivos", return_value=False),
+        ):
+            _buscar_ordem(driver, wait, "1030394792")
+
+        search_button.click.assert_called_once_with()
+        search_box.clear.assert_called_once_with()
+        search_box.send_keys.assert_called_once_with("1030394792")
+
+    def test_search_retries_with_active_field_when_clear_is_not_interactable(self):
+        search_box = Mock()
+        search_box.tag_name = "input"
+        search_box.clear.side_effect = ElementNotInteractableException(
+            "search input is not interactable"
+        )
+        result_wait = Mock()
+        navigation_wait = Mock()
+        driver = Mock()
+        driver.current_url = "https://example.lightning.force.com/lightning"
+
+        def open_work_order(_condition):
+            driver.current_url = (
+                "https://example.lightning.force.com/"
+                "lightning/r/WorkOrder/123/view"
+            )
+            return "opened"
+
+        result_wait.until.side_effect = open_work_order
+        navigation_wait.until.side_effect = lambda condition: condition(driver)
+
+        with (
+            patch(
+                "salesforce.WebDriverWait",
+                side_effect=[result_wait, navigation_wait],
+            ),
+            patch("salesforce._wait_for_stable_search_box", return_value=search_box),
+            patch("salesforce._active_search_box", return_value=search_box),
+            patch("salesforce._fechar_modal_arquivos", return_value=False),
+        ):
+            _buscar_ordem(driver, Mock(), "1030394792")
+
+        search_box.clear.assert_called_once_with()
+        search_box.send_keys.assert_any_call(Keys.CONTROL, "a", Keys.BACKSPACE)
+        search_box.send_keys.assert_any_call("1030394792")
+
+    def test_search_stops_after_bounded_stale_retries(self):
+        driver = Mock()
+        stale = StaleElementReferenceException("search input rerendered")
+        with (
+            patch("salesforce._fechar_modal_arquivos", return_value=False),
+            patch(
+                "salesforce._wait_for_stable_search_box",
+                side_effect=[stale, stale],
+            ) as stable_search_box,
+        ):
+            with self.assertRaises(_SearchStaleError):
+                _buscar_ordem(driver, Mock(), "1030394792")
+
+        self.assertEqual(stable_search_box.call_count, 2)
+
+    def test_search_result_is_activated_atomically(self):
+        search_button = Mock()
+        search_box = Mock()
+        search_box.tag_name = "input"
         first_wait = Mock()
         first_wait.until.return_value = search_button
         result_wait = Mock()
-        result_wait.until.return_value = search_result
         navigation_wait = Mock()
         navigation_wait.until.side_effect = lambda condition: condition(driver)
         driver = Mock()
-        driver.current_url = "https://example.lightning.force.com/lightning/r/0WOR123/view"
+        driver.current_url = "https://example.lightning.force.com/lightning"
+
+        def open_work_order(_condition):
+            driver.current_url = (
+                "https://example.lightning.force.com/"
+                "lightning/r/WorkOrder/123/view"
+            )
+            return "opened"
+
+        result_wait.until.side_effect = open_work_order
         driver.find_elements.return_value = [
             SimpleNamespace(text="Ordem de Serviço COE_CS1030177305")
         ]
@@ -782,69 +913,95 @@ class SalesforceNavigationTests(unittest.TestCase):
             search_calls.index("clear"),
             search_calls.index("send_keys"),
         )
-        self.assertEqual(driver.execute_script.call_count, 2)
-        self.assertIs(driver.execute_script.call_args_list[0].args[1], search_button)
-        self.assertIs(driver.execute_script.call_args_list[1].args[1], search_result)
-        search_result.click.assert_not_called()
+        self.assertEqual(driver.execute_script.call_count, 1)
+        self.assertIs(driver.execute_script.call_args.args[1], search_button)
+
+    def test_search_does_not_accept_the_previously_open_work_order_page(self):
+        search_box = Mock()
+        search_box.tag_name = "input"
+        result_wait = Mock()
+        result_wait.until.return_value = "opened"
+        navigation_wait = Mock()
+        driver = Mock()
+        driver.current_url = (
+            "https://example.lightning.force.com/"
+            "lightning/r/WorkOrder/123/view"
+        )
+
+        def wait_for_new_work_order(condition):
+            if not condition(driver):
+                raise TimeoutException()
+            return True
+
+        navigation_wait.until.side_effect = wait_for_new_work_order
+
+        with (
+            patch(
+                "salesforce.WebDriverWait",
+                side_effect=[result_wait, navigation_wait],
+            ),
+            patch("salesforce._wait_for_stable_search_box", return_value=search_box),
+            patch("salesforce._fechar_modal_arquivos", return_value=False),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "a página permaneceu no registro anterior",
+            ):
+                _buscar_ordem(driver, Mock(), "1030394792")
 
     def test_opens_related_tab_and_waits_for_it_to_be_selected(self):
-        selected = {"value": False}
-        tab = Mock()
-        tab.text = "Relacionado"
-        tab.get_attribute.side_effect = lambda name: (
-            "true" if selected["value"] else "false"
-        ) if name == "aria-selected" else None
-        download_button = Mock()
-        download_button.is_displayed.return_value = True
-        download_button.is_enabled.return_value = True
         driver = Mock()
-        driver.find_elements.side_effect = [[tab], [tab]]
-
-        def click_related_tab(_script, clicked_tab):
-            self.assertIs(clicked_tab, tab)
-            selected["value"] = True
-
-        driver.execute_script.side_effect = click_related_tab
+        driver.execute_script.side_effect = ["clicked", "selected"]
         wait = Mock()
         wait.until.side_effect = lambda condition: condition(driver)
 
         _abrir_aba_relacionados(driver, wait, "1030177305")
 
-        self.assertTrue(selected["value"])
-        self.assertEqual(driver.find_elements.call_count, 2)
+        self.assertEqual(driver.execute_script.call_count, 2)
+        self.assertIn(
+            "element.shadowRoot",
+            driver.execute_script.call_args.args[0],
+        )
+
+    def test_related_tab_uses_visible_appointment_card_when_already_open(self):
+        driver = Mock()
+        driver.execute_script.side_effect = ["content-ready", "content-ready"]
+        wait = Mock()
+        wait.until.side_effect = lambda condition: condition(driver)
+
+        _abrir_aba_relacionados(driver, wait, "1030394792")
+
+        self.assertEqual(driver.execute_script.call_count, 2)
+        self.assertIn(
+            "compromissos de serviços",
+            driver.execute_script.call_args.args[0],
+        )
 
     def test_finds_service_appointments_in_the_work_order_related_card(self):
         appointment_url = (
             "https://example.lightning.force.com/"
             "lightning/r/08pRo000000000001/view"
         )
-        appointment_link = Mock()
-        appointment_link.get_attribute.return_value = appointment_url
-        card = Mock()
-        card.find_elements.side_effect = lambda _by, selector: (
-            [appointment_link]
-            if selector == ".//a[contains(@href, '/lightning/r/08p')]"
-            else []
-        )
         driver = Mock()
-        driver.find_elements.return_value = [card]
+        driver.execute_script.return_value = [appointment_url]
         wait = Mock()
         wait.until.side_effect = lambda condition: condition(driver)
 
         result = _compromissos_relacionados(wait, "1030177305")
 
         self.assertEqual(result, [appointment_url])
+        self.assertIn(
+            "element.shadowRoot",
+            driver.execute_script.call_args.args[0],
+        )
+        self.assertIn(
+            "Compromissos de serviços",
+            driver.execute_script.call_args.args[0],
+        )
 
     def test_returns_empty_when_related_work_order_has_no_appointments(self):
-        heading = SimpleNamespace(text="Compromissos de serviços (0)")
-        card = Mock()
-        card.find_elements.side_effect = lambda _by, selector: (
-            [heading]
-            if selector == ".//h2[contains(., 'Compromissos de serviços')]"
-            else []
-        )
         driver = Mock()
-        driver.find_elements.return_value = [card]
+        driver.execute_script.return_value = []
         wait = Mock()
         wait.until.side_effect = lambda condition: condition(driver)
 
@@ -917,16 +1074,23 @@ class SalesforceNavigationTests(unittest.TestCase):
         search_box = Mock()
         search_box.tag_name = "lightning-input"
         search_box.get_attribute.return_value = "saInput"
-        search_result = Mock()
         wait = Mock()
         wait.until.return_value = search_button
         result_wait = Mock()
-        result_wait.until.return_value = search_result
         navigation_wait = Mock()
         driver = Mock()
         driver.current_url = (
             "https://example.lightning.force.com/lightning/r/WorkOrder/123/view"
         )
+
+        def open_work_order(_condition):
+            driver.current_url = (
+                "https://example.lightning.force.com/"
+                "lightning/r/WorkOrder/456/view"
+            )
+            return "opened"
+
+        result_wait.until.side_effect = open_work_order
         driver.switch_to.active_element = search_box
         navigation_wait.until.side_effect = lambda condition: condition(driver)
 
@@ -978,6 +1142,37 @@ class SalesforceNavigationTests(unittest.TestCase):
         self.assertIs(result, search_box)
         self.assertEqual(visible_search_box.call_count, 4)
 
+    def test_search_box_wait_retries_when_lookup_goes_stale(self):
+        search_box = Mock()
+        driver = Mock()
+        driver.execute_script.return_value = [321, 52, 664, 32]
+
+        def until_stable(condition):
+            for _ in range(5):
+                result = condition(driver)
+                if result:
+                    return result
+            raise TimeoutException()
+
+        with (
+            patch("salesforce.WebDriverWait") as wait_class,
+            patch(
+                "salesforce._visible_search_box",
+                side_effect=[
+                    StaleElementReferenceException("search input rerendered"),
+                    search_box,
+                    search_box,
+                    search_box,
+                ],
+            ) as visible_search_box,
+        ):
+            wait_class.return_value.until.side_effect = until_stable
+
+            result = _wait_for_stable_search_box(driver, timeout=2)
+
+        self.assertIs(result, search_box)
+        self.assertEqual(visible_search_box.call_count, 4)
+
     def test_search_box_does_not_select_input_outside_dialog(self):
         driver = Mock()
         driver.execute_script.return_value = None
@@ -996,19 +1191,16 @@ class SalesforceNavigationTests(unittest.TestCase):
 
     def test_search_results_match_inside_shadow_dom_without_case_sensitivity(self):
         driver = Mock()
-        result = Mock()
-        driver.execute_script.return_value = result
+        driver.execute_script.return_value = True
 
-        self.assertIs(
-            _matching_work_order_result(driver, "1030177305"),
-            result,
-        )
+        self.assertTrue(_matching_work_order_result(driver, "1030177305"))
         script = driver.execute_script.call_args.args[0]
         self.assertIn("element.shadowRoot", script)
         self.assertIn("notePattern.test(label)", script)
         self.assertIn(r"'(^|\\D)' + note + '(\\D|$)'", script)
         self.assertIn("ordem", script)
         self.assertIn("toLowerCase()", script)
+        self.assertIn("result.click()", script)
 
     def test_explicit_no_results_is_distinguished_from_a_search_timeout(self):
         driver = Mock()
@@ -2251,43 +2443,46 @@ class WhatsAppDeliveryTests(unittest.TestCase):
             create_browser.assert_not_called()
 
 class SalesforceDownloadTests(unittest.TestCase):
-    def test_files_button_is_found_inside_shadow_dom(self):
+    def test_files_button_is_clicked_atomically_inside_shadow_dom(self):
         driver = Mock()
-        button = Mock()
-        driver.execute_script.return_value = button
+        driver.execute_script.return_value = True
 
-        result = _files_download_button(driver)
+        result = _click_files_download_button(driver)
 
-        self.assertIs(result, button)
+        self.assertTrue(result)
         script = driver.execute_script.call_args.args[0]
         self.assertIn("element.shadowRoot", script)
         self.assertIn("baixar arquivos", script)
         self.assertIn("aria-disabled", script)
+        self.assertIn("button.click()", script)
+
+    def test_files_button_search_retries_after_stale_reference(self):
+        driver = Mock()
+        driver.execute_script.side_effect = StaleElementReferenceException(
+            "button was replaced"
+        )
+
+        self.assertFalse(_click_files_download_button(driver))
 
     def test_file_modal_is_closed_after_download_or_no_images(self):
         driver = Mock()
-        modal = Mock()
-        close_button = Mock()
-        driver.execute_script.side_effect = [(modal, close_button), None, False]
+        driver.execute_script.side_effect = ["clicked", False]
         wait = Mock()
         wait.until.side_effect = lambda condition: condition(driver)
 
         with patch("salesforce.WebDriverWait", return_value=wait):
             self.assertTrue(_fechar_modal_arquivos(driver))
 
-        driver.execute_script.assert_any_call(
-            "arguments[0].click()",
-            close_button,
-        )
+        self.assertIn("closeButton.click()", driver.execute_script.call_args_list[0].args[0])
 
     def test_open_file_modal_without_close_control_is_reported(self):
         driver = Mock()
-        driver.execute_script.return_value = (Mock(), None)
+        driver.execute_script.return_value = "missing-close"
 
         with self.assertRaisesRegex(RuntimeError, "botão para fechá-la"):
             _fechar_modal_arquivos(driver)
 
-    def test_file_modal_cleanup_runs_even_when_download_processing_fails(self):
+    def test_file_modal_is_left_open_when_download_processing_fails(self):
         driver = Mock()
         with (
             patch(
@@ -2304,7 +2499,28 @@ class SalesforceDownloadTests(unittest.TestCase):
                     Path("."),
                 )
 
-        close_modal.assert_called_once_with(driver)
+        close_modal.assert_not_called()
+
+    def test_modal_selection_and_download_are_performed_atomically(self):
+        driver = Mock()
+        driver.execute_script.return_value = {"started": True}
+
+        result = _select_and_download_modal_images(driver)
+
+        self.assertEqual(result, {"started": True})
+        script = driver.execute_script.call_args.args[0]
+        self.assertIn("input[type=\"checkbox\"]", script)
+        self.assertIn("rows[index].checkbox.click()", script)
+        self.assertIn("rows.some(row => !row.checkbox.checked)", script)
+        self.assertIn("downloadButton.click()", script)
+
+    def test_modal_selection_retries_after_stale_reference(self):
+        driver = Mock()
+        driver.execute_script.side_effect = StaleElementReferenceException(
+            "modal row was replaced"
+        )
+
+        self.assertFalse(_select_and_download_modal_images(driver))
 
     def test_active_salesforce_record_tab_can_be_closed_without_closing_chrome(self):
         driver = Mock()
@@ -2487,7 +2703,6 @@ class SalesforceDownloadTests(unittest.TestCase):
         read_status.assert_called_once_with(driver)
 
     def test_empty_file_modal_returns_no_images_without_clicking_download(self):
-        toolbar_button = Mock()
         close_button = Mock()
         modal = Mock()
         modal.is_displayed.return_value = True
@@ -2501,14 +2716,12 @@ class SalesforceDownloadTests(unittest.TestCase):
         modal.find_elements.side_effect = modal_elements
 
         initial_wait = Mock()
-        initial_wait.until.return_value = toolbar_button
+        initial_wait.until.return_value = True
         modal_wait = Mock()
         modal_wait.until.side_effect = lambda condition: condition(driver)
         file_list_wait = Mock()
         file_list_wait.until.side_effect = lambda condition: condition(driver)
         driver = Mock()
-        driver.find_elements.return_value = [modal]
-        driver.execute_script.return_value = []
 
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -2517,6 +2730,11 @@ class SalesforceDownloadTests(unittest.TestCase):
                 side_effect=[modal_wait, file_list_wait],
             ),
             patch("salesforce._fechar_modal_arquivos"),
+            patch("salesforce._visible_file_modal", return_value=True),
+            patch(
+                "salesforce._select_and_download_modal_images",
+                return_value={"empty": True},
+            ),
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2525,111 +2743,35 @@ class SalesforceDownloadTests(unittest.TestCase):
                 Path(directory),
             )
         self.assertEqual(result, [])
-        toolbar_button.click.assert_not_called()
-        driver.execute_script.assert_any_call(
-            "arguments[0].click()",
-            toolbar_button,
-        )
-        driver.execute_script.assert_any_call(
-            "arguments[0].click()",
-            close_button,
-        )
-        self.assertEqual(driver.execute_script.call_count, 4)
-
-    def test_modal_image_rows_are_found_inside_shadow_dom(self):
-        checkbox = Mock()
-        modal = Mock()
-        driver = Mock()
-        driver.execute_script.return_value = [
-            {"checkbox": checkbox, "filename": "10001129.jpg"},
-            {"checkbox": Mock(), "filename": "10001130.jpg"},
-        ]
-
-        rows = _modal_image_rows(driver, modal)
-
-        self.assertEqual(
-            rows,
-            [(checkbox, "10001129.jpg"), (driver.execute_script.return_value[1]["checkbox"], "10001130.jpg")],
-        )
-        script = driver.execute_script.call_args.args[0]
-        self.assertIn("element.shadowRoot", script)
-        self.assertIn("input[type=\"checkbox\"]", script)
-
-    def test_modal_download_button_is_found_inside_shadow_dom(self):
-        modal = Mock()
-        button = Mock()
-        driver = Mock()
-        driver.execute_script.return_value = button
-
-        result = _modal_download_button(driver, modal)
-
-        self.assertIs(result, button)
-        script = driver.execute_script.call_args.args[0]
-        self.assertIn("element.shadowRoot", script)
-        self.assertIn("label === 'baixar'", script)
 
     def test_waits_for_modal_file_rows_before_selecting_and_downloading(self):
-        heading = Mock()
-        heading.is_displayed.return_value = True
-        toolbar_button = Mock()
-        checkbox = Mock()
-        checkbox.is_selected.return_value = False
-        photo_rows = [{"checkbox": checkbox, "filename": "equipe/foto.jpg"}]
-        modal = Mock()
-        modal.is_displayed.return_value = True
-        modal.text = "Arquivo Tipo Baixar"
-        modal.find_elements.side_effect = lambda _by, selector: (
-            [download_button]
-            if selector == ".//button[normalize-space(.)='Baixar']"
-            else []
-        )
-        download_button = Mock()
-
         def create_zip():
             with zipfile.ZipFile(Path(directory) / "download.zip", "w") as archive:
                 archive.writestr("equipe/foto.jpg", b"image")
                 archive.writestr("equipe/relatorio.pdf", b"document")
 
         initial_wait = Mock()
-        initial_wait.until.return_value = toolbar_button
+        initial_wait.until.return_value = True
         modal_wait = Mock()
         modal_wait.until.side_effect = lambda condition: condition(driver)
         file_list_wait = Mock()
-        polls = {"count": 0}
-
-        def wait_for_rows(condition):
-            result = condition(driver)
-            if not result:
-                polls["count"] += 1
-                result = condition(driver)
-            return result
-
-        file_list_wait.until.side_effect = wait_for_rows
-        download_wait = Mock()
-        download_wait.until.return_value = download_button
+        file_list_wait.until.side_effect = lambda condition: condition(driver)
         driver = Mock()
-        driver.find_elements.return_value = [modal]
-
-        row_scans = {"count": 0}
-
-        def execute_script(script, target):
-            if "const matches = []" in script:
-                row_scans["count"] += 1
-                return [] if row_scans["count"] == 1 else photo_rows
-            if target is download_button:
-                create_zip()
-
-        driver.execute_script.side_effect = execute_script
 
         with (
             tempfile.TemporaryDirectory() as directory,
             patch(
                 "salesforce.WebDriverWait",
-                side_effect=[modal_wait, file_list_wait, download_wait],
+                side_effect=[modal_wait, file_list_wait],
             ),
             patch("salesforce.time.monotonic", side_effect=[0, 0, 0, 3, 3]),
             patch("salesforce.time.sleep"),
             patch("salesforce._fechar_modal_arquivos"),
+            patch("salesforce._visible_file_modal", return_value=True),
+            patch(
+                "salesforce._select_and_download_modal_images",
+                side_effect=lambda _driver: (create_zip() or {"started": True}),
+            ) as select_and_download,
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2645,37 +2787,22 @@ class SalesforceDownloadTests(unittest.TestCase):
             )
             self.assertFalse((Path(directory) / "download.zip").exists())
 
-        driver.execute_script.assert_any_call(
-            "arguments[0].click()",
-            checkbox,
-        )
-        driver.execute_script.assert_any_call(
-            "arguments[0].click()",
-            download_button,
-        )
-        self.assertEqual(polls["count"], 1)
-        self.assertGreaterEqual(row_scans["count"], 3)
+        select_and_download.assert_called_once_with(driver)
 
     def test_direct_download_from_files_button_is_extracted_without_modal(self):
-        toolbar_button = Mock()
-
         def create_zip():
             with zipfile.ZipFile(Path(directory) / "download.zip", "w") as archive:
                 archive.writestr("equipe/foto.jpg", b"image")
                 archive.writestr("equipe/relatorio.pdf", b"document")
 
         initial_wait = Mock()
-        initial_wait.until.return_value = toolbar_button
+        initial_wait.until.side_effect = lambda _condition: (
+            create_zip() or True
+        )
         download_wait = Mock()
         download_wait.until.side_effect = lambda condition: condition(driver)
         driver = Mock()
         driver.find_elements.return_value = []
-
-        def click_files_button(script, button):
-            if script == "arguments[0].click()" and button is toolbar_button:
-                create_zip()
-
-        driver.execute_script.side_effect = click_files_button
 
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -2683,6 +2810,7 @@ class SalesforceDownloadTests(unittest.TestCase):
             patch("salesforce.time.monotonic", side_effect=[0, 0, 0, 3, 3]),
             patch("salesforce.time.sleep"),
             patch("salesforce._fechar_modal_arquivos"),
+            patch("salesforce._visible_file_modal", return_value=False),
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2698,15 +2826,9 @@ class SalesforceDownloadTests(unittest.TestCase):
             )
             self.assertFalse((Path(directory) / "download.zip").exists())
 
-        toolbar_button.click.assert_not_called()
-        driver.execute_script.assert_any_call(
-            "arguments[0].click()",
-            toolbar_button,
-        )
-        driver.find_elements.assert_called_once()
+        driver.find_elements.assert_not_called()
 
     def test_empty_file_table_with_headers_returns_no_images(self):
-        toolbar_button = Mock()
         close_button = Mock()
         modal = Mock()
         modal.is_displayed.return_value = True
@@ -2719,14 +2841,12 @@ class SalesforceDownloadTests(unittest.TestCase):
             else []
         )
         initial_wait = Mock()
-        initial_wait.until.return_value = toolbar_button
+        initial_wait.until.return_value = True
         modal_wait = Mock()
         modal_wait.until.side_effect = lambda condition: condition(driver)
         file_list_wait = Mock()
         file_list_wait.until.side_effect = lambda condition: condition(driver)
         driver = Mock()
-        driver.find_elements.return_value = [modal]
-        driver.execute_script.return_value = []
 
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -2735,6 +2855,11 @@ class SalesforceDownloadTests(unittest.TestCase):
                 side_effect=[modal_wait, file_list_wait],
             ),
             patch("salesforce._fechar_modal_arquivos"),
+            patch("salesforce._visible_file_modal", return_value=True),
+            patch(
+                "salesforce._select_and_download_modal_images",
+                return_value={"empty": True},
+            ),
         ):
             result = _baixar_arquivos_relacionados(
                 driver,
@@ -2744,15 +2869,14 @@ class SalesforceDownloadTests(unittest.TestCase):
             )
 
         self.assertEqual(result, [])
-        self.assertEqual(driver.execute_script.call_count, 4)
-        driver.execute_script.assert_any_call(
-            "arguments[0].click()",
-            close_button,
-        )
 
     def test_reports_failure_to_open_the_related_tab(self):
         with tempfile.TemporaryDirectory() as directory:
             driver = Mock()
+            driver.current_url = (
+                "https://example.lightning.force.com/"
+                "lightning/r/WorkOrder/123/view"
+            )
             with (
                 patch("salesforce.WebDriverWait", return_value=Mock()),
                 patch("salesforce._buscar_ordem"),

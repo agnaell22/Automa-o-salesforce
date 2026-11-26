@@ -10,6 +10,7 @@ from pathlib import Path
 from selenium import webdriver
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
+    ElementNotInteractableException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
@@ -27,6 +28,10 @@ SEARCH_RESULTS_TIMEOUT_SECONDS = 12
 DOWNLOAD_TIMEOUT_SECONDS = 60
 SEARCH_FIELD_STABLE_POLLS = 3
 PHOTO_EXTENSION = re.compile(r"\.(?:jpe?g|png|gif|webp|heic|bmp)$", re.IGNORECASE)
+
+
+class _SearchStaleError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -99,9 +104,62 @@ def _wait_for_login(driver: webdriver.Chrome, base_url: str) -> None:
 def _buscar_ordem(
     driver: webdriver.Chrome, wait: WebDriverWait, nota: str
 ) -> None:
+    failed_steps: list[str] = []
+    for attempt in range(2):
+        current_step = ["preparar a busca"]
+        try:
+            _buscar_ordem_once(driver, wait, nota, current_step)
+            return
+        except StaleElementReferenceException as error:
+            failed_steps.append(
+                f"tentativa {attempt + 1}: {current_step[0]}"
+            )
+            if attempt:
+                raise _SearchStaleError(
+                    f"A busca da nota {nota} perdeu a referência à página do "
+                    "Salesforce mesmo após tentar novamente. Etapas: "
+                    f"{'; '.join(failed_steps)}. "
+                    f"{error.msg.splitlines()[0]}"
+                ) from error
+
+
+def _fill_search_box(
+    driver: webdriver.Chrome,
+    search_box: WebElement,
+    nota: str,
+) -> None:
+    try:
+        if search_box.tag_name.casefold() == "lightning-input":
+            search_box.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE)
+        else:
+            search_box.clear()
+        search_box.send_keys(nota)
+    except ElementNotInteractableException as error:
+        active_search_box = _active_search_box(driver)
+        if not active_search_box:
+            driver.execute_script("arguments[0].focus()", search_box)
+            active_search_box = _active_search_box(driver) or search_box
+        try:
+            active_search_box.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE)
+            active_search_box.send_keys(nota)
+        except StaleElementReferenceException:
+            raise
+        except WebDriverException:
+            raise error
+
+
+def _buscar_ordem_once(
+    driver: webdriver.Chrome,
+    wait: WebDriverWait,
+    nota: str,
+    current_step: list[str],
+) -> None:
+    current_step[0] = "verificar se há modal de arquivos aberto"
     _fechar_modal_arquivos(driver)
+    current_step[0] = "localizar o campo de pesquisa"
     search_box = _wait_for_stable_search_box(driver, timeout=0.5)
     if not search_box:
+        current_step[0] = "localizar e clicar no botão Pesquisar"
         try:
             search_button = wait.until(_visible_search_button)
             try:
@@ -117,6 +175,8 @@ def _buscar_ordem(
                 f"O botão de pesquisa do Salesforce não apareceu para a nota "
                 f"{nota}."
             ) from error
+        except StaleElementReferenceException:
+            raise
         except WebDriverException as error:
             raise RuntimeError(
                 f"Não foi possível abrir a busca do Salesforce: "
@@ -124,8 +184,12 @@ def _buscar_ordem(
             ) from error
 
         if not search_box:
+            current_step[0] = "aguardar o campo após abrir a pesquisa"
             search_box = _wait_for_stable_search_box(driver, timeout=1.5)
         if not search_box:
+            search_box = _active_search_box(driver)
+        if not search_box:
+            current_step[0] = "reabrir a pesquisa pelo botão"
             try:
                 search_button = wait.until(_visible_search_button)
                 driver.execute_script("arguments[0].click()", search_button)
@@ -134,31 +198,37 @@ def _buscar_ordem(
                     f"O botão de pesquisa do Salesforce não apareceu para a "
                     f"nota {nota}."
                 ) from error
+            except StaleElementReferenceException:
+                raise
             except WebDriverException as error:
                 raise RuntimeError(
                     f"Não foi possível reabrir a busca do Salesforce: "
                     f"{error.msg.splitlines()[0]}"
                 ) from error
 
+            current_step[0] = "aguardar o campo após reabrir a pesquisa"
             search_box = _wait_for_stable_search_box(driver, timeout=5)
+            if not search_box:
+                search_box = _active_search_box(driver)
 
     if not search_box:
         raise RuntimeError(
             f"O campo de busca da nota {nota} não apareceu após abrir a pesquisa."
         )
 
+    current_step[0] = "limpar e preencher o campo de pesquisa"
     try:
-        if search_box.tag_name.casefold() == "lightning-input":
-            search_box.send_keys(Keys.CONTROL, "a", Keys.BACKSPACE)
-        else:
-            search_box.clear()
-        search_box.send_keys(nota)
+        _fill_search_box(driver, search_box, nota)
+    except StaleElementReferenceException:
+        raise
     except WebDriverException as error:
         raise RuntimeError(
-            f"O campo de busca da nota {nota} não pôde ser limpo ou não aceitou texto: "
+            f"O campo de busca da nota {nota} não pôde ser focado, limpo ou preenchido: "
             f"{error.msg.splitlines()[0]}"
         ) from error
 
+    previous_url = driver.current_url
+    current_step[0] = "localizar e abrir o resultado da busca"
     try:
         result = WebDriverWait(driver, SEARCH_RESULTS_TIMEOUT_SECONDS).until(
             lambda browser: _work_order_search_result(browser, nota)
@@ -174,25 +244,20 @@ def _buscar_ordem(
             f"Nenhuma Ordem de Trabalho foi encontrada para a nota {nota}."
         )
 
-    try:
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();",
-            result,
-        )
-    except WebDriverException as error:
-        raise RuntimeError(
-            f"Não foi possível abrir o resultado da nota {nota}: "
-            f"{error.msg.splitlines()[0]}"
-        ) from error
-
     def work_order_opened(browser: webdriver.Chrome) -> bool:
-        return "/lightning/r/WorkOrder/" in browser.current_url
+        current_url = browser.current_url
+        return (
+            "/lightning/r/WorkOrder/" in current_url
+            and current_url != previous_url
+        )
 
+    current_step[0] = "aguardar a abertura da Ordem de Serviço"
     try:
         WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(work_order_opened)
     except TimeoutException as error:
         raise RuntimeError(
-            f"A busca da nota {nota} não abriu uma Ordem de Trabalho."
+            f"A busca da nota {nota} não abriu uma nova Ordem de Trabalho; "
+            "a página permaneceu no registro anterior."
         ) from error
 
 def _visible_search_button(driver: webdriver.Chrome) -> WebElement | bool:
@@ -277,40 +342,40 @@ def _wait_for_stable_search_box(
 
     def stable_search_box(browser: webdriver.Chrome) -> WebElement | bool:
         nonlocal previous_id, previous_rect, stable_polls
-        search_box = _visible_search_box(browser)
-        if not search_box:
-            previous_id = None
-            previous_rect = None
-            stable_polls = 0
-            return False
-
         try:
+            search_box = _visible_search_box(browser)
+            if not search_box:
+                previous_id = None
+                previous_rect = None
+                stable_polls = 0
+                return False
+
             rect = browser.execute_script(
                 "const r=arguments[0].getBoundingClientRect(); "
                 "return [r.x, r.y, r.width, r.height]",
                 search_box,
             )
+            if not rect or rect[2] <= 0 or rect[3] <= 0:
+                previous_id = None
+                previous_rect = None
+                stable_polls = 0
+                return False
+
+            current_rect = tuple(round(value) for value in rect)
+            current_id = search_box.id
+            if current_id == previous_id and current_rect == previous_rect:
+                stable_polls += 1
+            else:
+                previous_id = current_id
+                previous_rect = current_rect
+                stable_polls = 1
+
+            return search_box if stable_polls >= SEARCH_FIELD_STABLE_POLLS else False
         except StaleElementReferenceException:
             previous_id = None
             previous_rect = None
             stable_polls = 0
             return False
-
-        if not rect or rect[2] <= 0 or rect[3] <= 0:
-            previous_id = None
-            previous_rect = None
-            stable_polls = 0
-            return False
-
-        current_rect = tuple(round(value) for value in rect)
-        if search_box.id == previous_id and current_rect == previous_rect:
-            stable_polls += 1
-        else:
-            previous_id = search_box.id
-            previous_rect = current_rect
-            stable_polls = 1
-
-        return search_box if stable_polls >= SEARCH_FIELD_STABLE_POLLS else False
 
     try:
         return WebDriverWait(driver, timeout, poll_frequency=0.25).until(
@@ -401,7 +466,7 @@ def _visible_search_box(driver: webdriver.Chrome) -> WebElement | bool:
 
 def _matching_work_order_result(
     driver: webdriver.Chrome, nota: str
-) -> WebElement | bool:
+) -> bool:
     return driver.execute_script(
         """
         function visible(element) {
@@ -441,10 +506,16 @@ def _matching_work_order_result(
             }
             return null;
         }
-        return findWorkOrder(document, arguments[0].toLowerCase());
+        const result = findWorkOrder(document, arguments[0].toLowerCase());
+        if (!result) {
+            return false;
+        }
+        result.scrollIntoView({block: 'center'});
+        result.click();
+        return true;
         """,
         nota,
-    ) or False
+    )
 
 
 def _no_work_order_results_visible(driver: webdriver.Chrome) -> bool:
@@ -485,10 +556,10 @@ def _no_work_order_results_visible(driver: webdriver.Chrome) -> bool:
 
 def _work_order_search_result(
     driver: webdriver.Chrome, nota: str
-) -> WebElement | str | bool:
+) -> str | bool:
     result = _matching_work_order_result(driver, nota)
     if result:
-        return result
+        return "opened"
     if _no_work_order_results_visible(driver):
         return "not-found"
     return False
@@ -499,59 +570,95 @@ def _abrir_aba_relacionados(
     wait: WebDriverWait,
     nota: str,
 ) -> None:
-    def related_tab(browser: webdriver.Chrome) -> WebElement | bool:
-        for tab in browser.find_elements(By.XPATH, "//*[@role='tab']"):
-            try:
-                label = " ".join(
-                    value
-                    for value in (
-                        tab.text,
-                        tab.get_attribute("aria-label") or "",
-                        tab.get_attribute("title") or "",
-                    )
-                    if value
-                ).casefold()
-                if "relacionado" in label or "related" in label:
-                    return tab
-            except StaleElementReferenceException:
-                continue
-        return False
+    def related_tab_state(browser: webdriver.Chrome, activate: bool) -> str | bool:
+        try:
+            return browser.execute_script(
+                """
+                function visible(element) {
+                    if (!element.isConnected) {
+                        return false;
+                    }
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none' && style.opacity !== '0';
+                }
+
+                function elementsIn(root, selector, result = []) {
+                    result.push(...root.querySelectorAll(selector));
+                    for (const element of root.querySelectorAll('*')) {
+                        if (element.shadowRoot) {
+                            elementsIn(element.shadowRoot, selector, result);
+                        }
+                    }
+                    return result;
+                }
+
+                function hasVisibleAppointmentsCard(root) {
+                    for (const article of elementsIn(
+                        root,
+                        'article, lightning-card'
+                    )) {
+                        if (!visible(article)) {
+                            continue;
+                        }
+                        const text = (
+                            article.innerText || article.textContent || ''
+                        ).replace(/\\s+/g, ' ').toLowerCase();
+                        if (text.includes('compromissos de serviços')) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                if (hasVisibleAppointmentsCard(document)) {
+                    return 'content-ready';
+                }
+
+                const tabs = elementsIn(document, '[role="tab"]').filter(tab => {
+                    const label = [
+                        tab.innerText || '',
+                        tab.textContent || '',
+                        tab.getAttribute('aria-label') || '',
+                        tab.getAttribute('title') || ''
+                    ].join(' ').toLowerCase();
+                    return visible(tab) &&
+                        (label.includes('relacionado') || label.includes('related'));
+                });
+                const selected = tabs.find(
+                    tab => tab.getAttribute('aria-selected') === 'true'
+                );
+                if (selected) {
+                    return 'selected';
+                }
+                if (!arguments[0] || !tabs.length) {
+                    return false;
+                }
+
+                const tab = tabs[0];
+                tab.scrollIntoView({block: 'center'});
+                tab.click();
+                return 'clicked';
+                """,
+                activate,
+            )
+        except StaleElementReferenceException:
+            return False
 
     try:
-        tab = wait.until(related_tab)
+        wait.until(lambda browser: related_tab_state(browser, activate=True))
     except TimeoutException as error:
         raise RuntimeError(
             f"A aba Relacionados da Ordem de Serviço da nota {nota} não apareceu."
         ) from error
 
     try:
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'}); "
-            "arguments[0].click();",
-            tab,
+        wait.until(
+            lambda browser: related_tab_state(browser, activate=False)
+            in {"selected", "content-ready"}
         )
-    except WebDriverException as error:
-        raise RuntimeError(
-            f"Não foi possível abrir a aba Relacionados da nota {nota}: "
-            f"{error.msg.splitlines()[0]}"
-        ) from error
-
-    def related_content_ready(browser: webdriver.Chrome) -> bool:
-        return any(
-            (
-                "relacionado" in (
-                    tab.text + " " + (tab.get_attribute("aria-label") or "")
-                ).casefold()
-                or "related" in (
-                    tab.text + " " + (tab.get_attribute("aria-label") or "")
-                ).casefold()
-            )
-            and tab.get_attribute("aria-selected") == "true"
-            for tab in browser.find_elements(By.XPATH, "//*[@role='tab']")
-        )
-
-    try:
-        wait.until(related_content_ready)
     except TimeoutException as error:
         raise RuntimeError(
             f"A aba Relacionados da Ordem de Serviço da nota {nota} "
@@ -564,31 +671,66 @@ def _compromissos_relacionados(
     nota: str,
 ) -> list[str]:
     def related_appointments(browser: webdriver.Chrome):
-        cards = browser.find_elements(
-            By.XPATH,
-            "//article[contains(., 'Compromissos de serviços')]",
-        )
-        for card in cards:
-            hrefs = list(
-                dict.fromkeys(
-                    href
-                    for anchor in card.find_elements(
-                        By.XPATH, ".//a[contains(@href, '/lightning/r/08p')]"
-                    )
-                    if (href := anchor.get_attribute("href"))
-                )
-            )
-            if hrefs:
-                return hrefs
+        try:
+            return browser.execute_script(
+                """
+                function visible(element) {
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return element.isConnected &&
+                        rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none' && style.opacity !== '0';
+                }
 
-            headings = card.find_elements(
-                By.XPATH, ".//h2[contains(., 'Compromissos de serviços')]"
+                function elementsIn(root, selector, result = []) {
+                    result.push(...root.querySelectorAll(selector));
+                    for (const element of root.querySelectorAll('*')) {
+                        if (element.shadowRoot) {
+                            elementsIn(element.shadowRoot, selector, result);
+                        }
+                    }
+                    return result;
+                }
+
+                const cards = elementsIn(
+                    document,
+                    'article, lightning-card'
+                ).filter(article =>
+                    visible(article) &&
+                    (article.innerText || article.textContent || '')
+                        .replace(/\\s+/g, ' ').toLowerCase()
+                        .includes('compromissos de serviços')
+                );
+                for (const card of cards) {
+                    const hrefs = [...new Set(
+                        elementsIn(card, 'a')
+                            .map(anchor => anchor.href)
+                            .filter(href =>
+                                /\\/lightning\\/r\\/(?:ServiceAppointment\\/)?08p[^/]+/i
+                                    .test(href)
+                            )
+                    )];
+                    if (hrefs.length) {
+                        return hrefs;
+                    }
+
+                    const heading = elementsIn(card, 'h2').find(element =>
+                        (element.innerText || element.textContent || '')
+                            .includes('Compromissos de serviços')
+                    );
+                    const count = heading &&
+                        (heading.innerText || heading.textContent || '')
+                            .match(/\\((\\d+)\\)/);
+                    if (count && count[1] === '0') {
+                        return [];
+                    }
+                }
+                return false;
+                """
             )
-            if headings:
-                count = re.search(r"\((\d+)\)", headings[0].text)
-                if count and count.group(1) == "0":
-                    return []
-        return False
+        except StaleElementReferenceException:
+            return False
 
     try:
         return wait.until(related_appointments)
@@ -719,9 +861,11 @@ def _ler_status_wfm(driver: webdriver.Chrome) -> str:
     return " | ".join(dict.fromkeys(values))
 
 
-def _files_download_button(driver: webdriver.Chrome) -> WebElement | bool:
-    return driver.execute_script(
-        """
+def _click_files_download_button(driver: webdriver.Chrome) -> bool:
+    try:
+        return bool(
+            driver.execute_script(
+                """
         function findFilesButton(root) {
             for (const button of root.querySelectorAll(
                 'button, [role="button"], lightning-button'
@@ -744,7 +888,9 @@ def _files_download_button(driver: webdriver.Chrome) -> WebElement | bool:
                     style.display !== 'none' &&
                     style.opacity !== '0'
                 ) {
-                    return button;
+                    button.scrollIntoView({block: 'center'});
+                    button.click();
+                    return true;
                 }
             }
 
@@ -756,11 +902,199 @@ def _files_download_button(driver: webdriver.Chrome) -> WebElement | bool:
                     }
                 }
             }
-            return null;
+            return false;
         }
         return findFilesButton(document);
         """
-    ) or False
+            )
+        )
+    except StaleElementReferenceException:
+        return False
+
+
+def _visible_file_modal(driver: webdriver.Chrome) -> bool:
+    return bool(
+        driver.execute_script(
+            """
+            function visible(element) {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return element.isConnected &&
+                    rect.width > 0 && rect.height > 0 &&
+                    style.visibility !== 'hidden' &&
+                    style.display !== 'none' && style.opacity !== '0';
+            }
+
+            function elementsIn(root, selector) {
+                const found = [...root.querySelectorAll(selector)];
+                for (const element of root.querySelectorAll('*')) {
+                    if (element.shadowRoot) {
+                        found.push(...elementsIn(element.shadowRoot, selector));
+                    }
+                }
+                return found;
+            }
+
+            return elementsIn(
+                document,
+                '[role="dialog"], .slds-modal__container'
+            ).some(modal => {
+                const text = (modal.innerText || modal.textContent || '')
+                    .replace(/\\s+/g, ' ').toLowerCase();
+                return visible(modal) && /(arquivo|files?)/i.test(text);
+            });
+            """
+        )
+    )
+
+
+def _select_and_download_modal_images(
+    driver: webdriver.Chrome,
+) -> dict[str, bool] | bool:
+    try:
+        return (
+            driver.execute_script(
+                """
+                const photoName = /\\.(?:jpe?g|png|gif|webp|heic|bmp)$/i;
+
+                function visible(element) {
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return element.isConnected &&
+                        rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' &&
+                        style.display !== 'none' && style.opacity !== '0';
+                }
+
+                function elementsIn(root, selector) {
+                    const found = [...root.querySelectorAll(selector)];
+                    for (const element of root.querySelectorAll('*')) {
+                        if (element.shadowRoot) {
+                            found.push(...elementsIn(element.shadowRoot, selector));
+                        }
+                    }
+                    return found;
+                }
+
+                function findModal() {
+                    return elementsIn(
+                        document,
+                        '[role="dialog"], .slds-modal__container'
+                    ).reverse().find(modal => {
+                        const text = (modal.innerText || modal.textContent || '')
+                            .replace(/\\s+/g, ' ').toLowerCase();
+                        return visible(modal) &&
+                            /(arquivo|files?)/i.test(text);
+                    });
+                }
+
+                function photoRows(modal) {
+                    return elementsIn(modal, '[role="row"]')
+                        .filter(visible)
+                        .map(row => {
+                            const text = row.innerText || row.textContent || '';
+                            const filename = text
+                                .split(/\\r?\\n/)
+                                .map(line => line.trim())
+                                .find(line => photoName.test(line));
+                            const checkbox = elementsIn(
+                                row,
+                                'input[type="checkbox"]'
+                            ).find(input => !input.disabled);
+                            return filename
+                                ? {filename, checkbox}
+                                : null;
+                        })
+                        .filter(Boolean);
+                }
+
+                let modal = findModal();
+                if (!modal) {
+                    return false;
+                }
+
+                const modalText = (
+                    modal.innerText || modal.textContent || ''
+                ).replace(/\\s+/g, ' ').toLowerCase();
+                let rows = photoRows(modal);
+                if (!rows.length) {
+                    const hasFileRows = elementsIn(modal, '[role="row"]')
+                        .filter(visible)
+                        .some(row => {
+                            const text = row.innerText || row.textContent || '';
+                            return text.split(/\\r?\\n/).some(line =>
+                                /\\.[a-z0-9]{2,5}$/i.test(line.trim())
+                            );
+                        });
+                    return (
+                        /nenhum arquivo|sem arquivos|no files/.test(modalText) ||
+                        hasFileRows
+                    )
+                        ? {empty: true}
+                        : false;
+                }
+                if (rows.some(row => !row.checkbox)) {
+                    return false;
+                }
+
+                const imageCount = rows.length;
+                for (let index = 0; index < imageCount; index += 1) {
+                    modal = findModal();
+                    if (!modal) {
+                        return false;
+                    }
+                    rows = photoRows(modal);
+                    if (rows.length !== imageCount) {
+                        return false;
+                    }
+                    if (!rows[index].checkbox) {
+                        return false;
+                    }
+                    if (!rows[index].checkbox.checked) {
+                        rows[index].checkbox.click();
+                    }
+                }
+
+                modal = findModal();
+                if (!modal) {
+                    return false;
+                }
+                rows = photoRows(modal);
+                if (
+                    rows.length !== imageCount ||
+                    rows.some(row => !row.checkbox) ||
+                    rows.some(row => !row.checkbox.checked)
+                ) {
+                    return false;
+                }
+
+                const downloadButton = elementsIn(
+                    modal,
+                    'button, [role="button"], lightning-button'
+                ).find(button => {
+                    const label = [
+                        button.innerText || button.textContent || '',
+                        button.getAttribute('aria-label') || '',
+                        button.getAttribute('title') || '',
+                        button.getAttribute('label') || ''
+                    ].join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    return visible(button) &&
+                        label === 'baixar' &&
+                        !button.disabled &&
+                        button.getAttribute('aria-disabled') !== 'true';
+                });
+                if (!downloadButton) {
+                    return false;
+                }
+
+                downloadButton.click();
+                return {started: true};
+                """
+            )
+            or False
+        )
+    except StaleElementReferenceException:
+        return False
 
 
 def _baixar_arquivos_relacionados(
@@ -769,15 +1103,14 @@ def _baixar_arquivos_relacionados(
     nota: str,
     destination: Path,
 ) -> list[str]:
-    try:
-        return _baixar_arquivos_relacionados_impl(
-            driver,
-            wait,
-            nota,
-            destination,
-        )
-    finally:
-        _fechar_modal_arquivos(driver)
+    result = _baixar_arquivos_relacionados_impl(
+        driver,
+        wait,
+        nota,
+        destination,
+    )
+    _fechar_modal_arquivos(driver)
+    return result
 
 
 def _baixar_arquivos_relacionados_impl(
@@ -788,8 +1121,7 @@ def _baixar_arquivos_relacionados_impl(
 ) -> list[str]:
     before = {path.name for path in destination.iterdir()}
     try:
-        button = wait.until(_files_download_button)
-        driver.execute_script("arguments[0].click()", button)
+        wait.until(_click_files_download_button)
     except TimeoutException as error:
         raise RuntimeError(
             f"O botão de arquivos não carregou para a nota {nota}."
@@ -800,36 +1132,35 @@ def _baixar_arquivos_relacionados_impl(
             f"{error.msg.splitlines()[0]}"
         ) from error
 
-    def modal_or_download_started(
-        browser: webdriver.Chrome,
-    ) -> tuple[WebElement | None, bool] | bool:
-        dialogs = browser.find_elements(By.XPATH, "//*[@role='dialog']")
-        for dialog in reversed(dialogs):
-            if dialog.is_displayed():
-                return dialog, False
+    def modal_or_download_started(browser: webdriver.Chrome) -> str | bool:
+        try:
+            if _visible_file_modal(browser):
+                return "modal"
 
-        new_files = [
-            path
-            for path in destination.iterdir()
-            if path.is_file() and path.name not in before
-        ]
-        if new_files:
-            return None, True
+            new_files = [
+                path
+                for path in destination.iterdir()
+                if path.is_file() and path.name not in before
+            ]
+            if new_files:
+                return "direct"
 
-        body_text = browser.find_element(By.TAG_NAME, "body").text.casefold()
-        if any(
-            phrase in body_text
-            for phrase in (
-                "o download iniciará em breve",
-                "o download começará em breve",
-                "download will begin shortly",
-            )
-        ):
-            return None, True
-        return False
+            body_text = browser.find_element(By.TAG_NAME, "body").text.casefold()
+            if any(
+                phrase in body_text
+                for phrase in (
+                    "o download iniciará em breve",
+                    "o download começará em breve",
+                    "download will begin shortly",
+                )
+            ):
+                return "direct"
+            return False
+        except StaleElementReferenceException:
+            return False
 
     try:
-        modal, direct_download = WebDriverWait(
+        action_state = WebDriverWait(
             driver, PAGE_TIMEOUT_SECONDS
         ).until(modal_or_download_started)
     except TimeoutException as error:
@@ -838,69 +1169,24 @@ def _baixar_arquivos_relacionados_impl(
             f"o download para a nota {nota}."
         ) from error
 
-    def file_list_loaded(browser: webdriver.Chrome) -> WebElement | bool:
-        if modal is None:
-            return False
-        dialogs = browser.find_elements(By.XPATH, "//*[@role='dialog']")
-        for dialog in reversed(dialogs):
-            if not dialog.is_displayed():
-                continue
-            if _modal_image_rows(browser, dialog):
-                return dialog
-            text = dialog.text.casefold()
-            if any(
-                phrase in text
-                for phrase in (
-                    "nenhum arquivo",
-                    "no files",
-                    "sem arquivos",
-                )
-            ):
-                return dialog
-        return False
-
-    if modal is not None:
+    if action_state == "modal":
         try:
-            modal = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-                file_list_loaded
-            )
+            modal_result = WebDriverWait(
+                driver, PAGE_TIMEOUT_SECONDS
+            ).until(_select_and_download_modal_images)
         except TimeoutException as error:
             raise RuntimeError(
-                f"A lista de arquivos da nota {nota} não carregou as linhas "
-                "das imagens dentro do tempo limite."
+                f"Não foi possível selecionar e iniciar o download das imagens "
+                f"da nota {nota} no modal de arquivos."
             ) from error
-
-        photo_rows = _modal_image_rows(driver, modal)
-        if not photo_rows:
-            close_buttons = modal.find_elements(
-                By.XPATH, ".//button[contains(., 'Cancelar e fechar')]"
-            )
-            if close_buttons:
-                driver.execute_script("arguments[0].click()", close_buttons[0])
+        if modal_result.get("empty"):
             return []
-
-        for checkbox, _ in photo_rows:
-            if not checkbox.is_selected():
-                driver.execute_script("arguments[0].click()", checkbox)
-
-        try:
-            download_button = WebDriverWait(driver, PAGE_TIMEOUT_SECONDS).until(
-                lambda browser: _modal_download_button(browser, modal)
+        if not modal_result.get("started"):
+            raise RuntimeError(
+                f"O modal não confirmou a seleção e o início do download "
+                f"para a nota {nota}."
             )
-        except TimeoutException as error:
-            raise RuntimeError(
-                f"A janela de arquivos não apresentou a ação de download para a "
-                f"nota {nota}."
-            ) from error
-
-        try:
-            driver.execute_script("arguments[0].click()", download_button)
-        except WebDriverException as error:
-            raise RuntimeError(
-                f"Não foi possível iniciar o download da nota {nota}: "
-                f"{error.msg.splitlines()[0]}"
-            ) from error
-    elif not direct_download:
+    elif action_state != "direct":
         raise RuntimeError(
             f"A ação de download não foi confirmada para a nota {nota}."
         )
@@ -937,88 +1223,6 @@ def _baixar_arquivos_relacionados_impl(
         )
 
     return _extract_downloaded_images(downloaded, nota, destination)
-
-
-def _modal_image_rows(
-    driver: webdriver.Chrome,
-    modal: WebElement,
-) -> list[tuple[WebElement, str]]:
-    rows = driver.execute_script(
-        """
-        const matches = [];
-        const photoName = /\\.(?:jpe?g|png|gif|webp|heic|bmp)$/i;
-
-        function elementsIn(root, selector) {
-            const found = [...root.querySelectorAll(selector)];
-            for (const element of root.querySelectorAll('*')) {
-                if (element.shadowRoot) {
-                    found.push(...elementsIn(element.shadowRoot, selector));
-                }
-            }
-            return found;
-        }
-
-        for (const row of elementsIn(arguments[0], '[role="row"]')) {
-            const text = row.innerText || row.textContent || '';
-            const filename = text
-                .split(/\\r?\\n/)
-                .map(line => line.trim())
-                .find(line => photoName.test(line));
-            if (!filename) {
-                continue;
-            }
-
-            const checkbox = elementsIn(row, 'input[type="checkbox"]')
-                .find(input => !input.disabled);
-            if (checkbox) {
-                matches.push({checkbox, filename});
-            }
-        }
-        return matches;
-        """,
-        modal,
-    )
-    return [(row["checkbox"], row["filename"]) for row in rows]
-
-
-def _modal_download_button(
-    driver: webdriver.Chrome,
-    modal: WebElement,
-) -> WebElement | bool:
-    return driver.execute_script(
-        """
-        function findDownloadButton(root) {
-            for (const button of root.querySelectorAll('button')) {
-                const label = (button.innerText || button.textContent || '')
-                    .replace(/\\s+/g, ' ')
-                    .trim()
-                    .toLowerCase();
-                const rect = button.getBoundingClientRect();
-                if (
-                    label === 'baixar' &&
-                    !button.disabled &&
-                    rect.width > 0 &&
-                    rect.height > 0 &&
-                    getComputedStyle(button).visibility !== 'hidden'
-                ) {
-                    return button;
-                }
-            }
-
-            for (const element of root.querySelectorAll('*')) {
-                if (element.shadowRoot) {
-                    const button = findDownloadButton(element.shadowRoot);
-                    if (button) {
-                        return button;
-                    }
-                }
-            }
-            return null;
-        }
-        return findDownloadButton(arguments[0]);
-        """,
-        modal,
-    ) or False
 
 
 def _unique_image_path(destination: Path, nota: str, filename: str) -> Path:
@@ -1075,12 +1279,13 @@ def _extract_downloaded_images(
 
 
 def _fechar_modal_arquivos(driver: webdriver.Chrome) -> bool:
-    modal, close_button = driver.execute_script(
+    close_result = driver.execute_script(
         """
         function visible(element) {
             const rect = element.getBoundingClientRect();
             const style = getComputedStyle(element);
-            return rect.width > 0 && rect.height > 0 &&
+            return element.isConnected &&
+                rect.width > 0 && rect.height > 0 &&
                 style.visibility !== 'hidden' && style.display !== 'none' &&
                 style.opacity !== '0';
         }
@@ -1123,50 +1328,29 @@ def _fechar_modal_arquivos(driver: webdriver.Chrome) -> bool:
                     !button.disabled &&
                     /cancelar e fechar|fechar|close/.test(label);
             });
-            return [modal, closeButton || null];
+            if (!closeButton) {
+                return 'missing-close';
+            }
+            closeButton.click();
+            return 'clicked';
         }
-        return [null, null];
+        return 'absent';
         """
     )
-    if not modal:
+    if close_result == "absent":
         return False
-    if not close_button:
+    if close_result != "clicked":
         raise RuntimeError(
             "A janela de arquivos permaneceu aberta, mas não foi possível "
             "localizar o botão para fechá-la."
         )
 
-    driver.execute_script("arguments[0].click()", close_button)
-    closed = WebDriverWait(driver, 5).until(
-        lambda browser: not browser.execute_script(
-            """
-            function visible(element) {
-                const rect = element.getBoundingClientRect();
-                const style = getComputedStyle(element);
-                return rect.width > 0 && rect.height > 0 &&
-                    style.visibility !== 'hidden' && style.display !== 'none' &&
-                    style.opacity !== '0';
-            }
-            function elementsIn(root, selector) {
-                const elements = [...root.querySelectorAll(selector)];
-                for (const element of root.querySelectorAll('*')) {
-                    if (element.shadowRoot) {
-                        elements.push(...elementsIn(element.shadowRoot, selector));
-                    }
-                }
-                return elements;
-            }
-            return elementsIn(
-                document,
-                '[role="dialog"], .slds-modal__container'
-            ).some(modal => {
-                const text = (modal.innerText || modal.textContent || '')
-                    .replace(/\\s+/g, ' ').toLowerCase();
-                return visible(modal) && /(arquivo|files?)/i.test(text);
-            });
-            """
+    try:
+        closed = WebDriverWait(driver, 5).until(
+            lambda browser: not _visible_file_modal(browser)
         )
-    )
+    except StaleElementReferenceException:
+        closed = False
     if not closed:
         raise RuntimeError("A janela de arquivos não fechou após a consulta.")
     return True
@@ -1252,6 +1436,12 @@ def _processar_nota(
         _buscar_ordem(driver, wait, nota)
         work_order_opened = True
         work_order_url = driver.current_url
+        work_order_id = re.search(
+            r"/lightning/r/WorkOrder/([^/?]+)",
+            work_order_url,
+        )
+        if work_order_id:
+            print(f"Nota {nota}: Ordem de Serviço {work_order_id.group(1)}")
         stage = "abrir Relacionados na Ordem de Serviço"
         _abrir_aba_relacionados(driver, wait, nota)
         stage = "localizar Compromissos de Serviço relacionados"
@@ -1269,6 +1459,15 @@ def _processar_nota(
         appointment_errors: list[str] = []
         for index, appointment_url in enumerate(appointments):
             try:
+                appointment_id = re.search(
+                    r"/lightning/r/(?:ServiceAppointment/)?(08p[^/?]+)",
+                    appointment_url,
+                )
+                if appointment_id:
+                    print(
+                        f"Nota {nota}: Compromisso de Serviço "
+                        f"{appointment_id.group(1)}"
+                    )
                 if index:
                     driver.get(work_order_url)
                     wait.until(
@@ -1297,14 +1496,18 @@ def _processar_nota(
                 if not result.status_wfm:
                     result.status_wfm = appointment_status
                 stage = "baixar os arquivos do Compromisso de Serviço"
-                result.arquivos.extend(
-                    _baixar_arquivos_relacionados(
-                        driver,
-                        wait,
-                        nota,
-                        note_dir,
-                    )
+                downloaded_files = _baixar_arquivos_relacionados(
+                    driver,
+                    wait,
+                    nota,
+                    note_dir,
                 )
+                result.arquivos.extend(downloaded_files)
+                if downloaded_files:
+                    print(
+                        f"Nota {nota}: arquivos salvos em {note_dir}: "
+                        f"{', '.join(downloaded_files)}"
+                    )
             except (TimeoutError, TimeoutException, RuntimeError) as error:
                 appointment_errors.append(str(error))
             except WebDriverException as error:
@@ -1321,6 +1524,8 @@ def _processar_nota(
     except LookupError as error:
         result.status = "Não encontrada"
         result.erro = str(error)
+    except _SearchStaleError:
+        raise
     except (TimeoutError, TimeoutException, RuntimeError) as error:
         result.status = "Erro"
         result.erro = str(error)
@@ -1393,7 +1598,16 @@ def consultar_notas(
             note_started = time.monotonic()
             if index == 0:
                 output_fn(f"Iniciando a primeira busca: nota {note}...")
-            result = _processar_nota(driver, output_dir, note)
+            search_unstable = False
+            try:
+                result = _processar_nota(driver, output_dir, note)
+            except _SearchStaleError as error:
+                result = ResultadoNota(
+                    nota=note,
+                    status="Erro",
+                    erro=str(error),
+                )
+                search_unstable = True
             try:
                 driver.current_url
             except WebDriverException as error:
@@ -1422,6 +1636,13 @@ def consultar_notas(
                 output_fn(
                     "Chrome/Selenium não está mais disponível; interrompendo "
                     f"a fila após a nota {note}."
+                )
+                break
+            if search_unstable:
+                output_fn(
+                    "A pesquisa do Salesforce continuou instável após a "
+                    "tentativa de recuperação; fila interrompida. As notas "
+                    "restantes não foram processadas."
                 )
                 break
     finally:
